@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::{
     components::{ParentRoute, Route, A},
-    hooks::use_params,
+    hooks::{use_location, use_params},
     nested_router::Outlet,
     params::Params,
     ParamSegment, SsrMode, StaticSegment, WildcardSegment,
@@ -367,8 +367,10 @@ fn ItemListing() -> impl IntoView {
     let suspense_counters = expect_context::<RwSignal<SuspenseCounters>>();
     let resource =
         expect_context::<Resource<Result<Vec<i64>, ServerFnError>>>();
+    let pathname = use_location().pathname;
     let item_listing = move || {
         Suspend::new(async move {
+            let loaded = pathname.get_untracked();
             let result = resource.await.map(|items| items
             .into_iter()
             .map(move |item|
@@ -376,7 +378,7 @@ fn ItemListing() -> impl IntoView {
                 // adding an extra `/` in artix; manually construct `a` instead.
                 // <li><A href=format!("./{item}/")>"Item "{item}</A></li>
                 view! {
-                    <li>
+                    <li data-loaded=loaded.clone()>
                         <a href=format!("/instrumented/item/{item}/")>"Item "{item}</a>
                     </li>
                 }
@@ -426,11 +428,13 @@ fn ItemTop() -> impl IntoView {
 fn ItemOverview() -> impl IntoView {
     let suspense_counters = expect_context::<RwSignal<SuspenseCounters>>();
     let resource = expect_context::<Resource<Option<GetItemResult>>>();
+    let pathname = use_location().pathname;
     let item_view = move || {
         Suspend::new(async move {
+            let loaded = pathname.get_untracked();
             let result = resource.await.map(|GetItemResult(item, names)| {
                 view! {
-                    <p>{format!("Viewing {item:?}")}</p>
+                    <p data-loaded=loaded>{format!("Viewing {item:?}")}</p>
                     <ul>
                         {names
                             .into_iter()
@@ -477,6 +481,8 @@ fn ItemInspect() -> impl IntoView {
         move || params.get().map(|p| p.path),
         move |p| async move {
             // leptos::logging::log!("res_inspect: res_overview.await");
+            // Note: this resource is untracked here, though `params` changing
+            // will nonetheless results in the "expected" tracked updates.
             let overview = res_overview.await;
             // leptos::logging::log!("res_inspect: resolved res_overview.await");
             // let result =
@@ -492,14 +498,17 @@ fn ItemInspect() -> impl IntoView {
             // result
         },
     );
-    on_cleanup(|| {
-        if let Some(c) = use_context::<WriteSignal<Option<FieldNavCtx>>>() {
+    let ws = use_context::<WriteSignal<Option<FieldNavCtx>>>();
+    on_cleanup(move || {
+        if let Some(c) = ws {
             c.set(None);
         }
     });
+    let pathname = use_location().pathname;
     let inspect_view = move || {
         // leptos::logging::log!("inspect_view closure invoked");
         Suspend::new(async move {
+            let loaded = pathname.get_untracked();
             // leptos::logging::log!("inspect_view Suspend::new() called");
             let result = res_inspect.await.map(|InspectItemResult(item, name, fields)| {
                 // leptos::logging::log!("inspect_view res_inspect awaited");
@@ -514,7 +523,13 @@ fn ItemInspect() -> impl IntoView {
                         .into()
                 ));
                 view! {
-                    <p>{format!("Inspecting {item:?}")}</p>
+                    <p
+                        id="inspect-result"
+                        data-field=item.field.clone()
+                        data-loaded=loaded
+                    >
+                        {format!("Inspecting {item:?}")}
+                    </p>
                     <ul>
                         {fields
                             .iter()
@@ -560,7 +575,7 @@ fn ShowCounters() -> impl IntoView {
     //
     // However, upon `Reset Counters`, the mode from which the reset
     // was issued will result in the rendering be reflected as such, so
-    // if the intial state was SSR, resetting under CSR will result in
+    // if the initial state was SSR, resetting under CSR will result in
     // the CSR counters be rendered after.  However for the intents and
     // purpose for the testing only the CSR is cared for.
     //
@@ -660,26 +675,24 @@ impl From<Vec<FieldNavItem>> for FieldNavCtx {
 #[component]
 pub fn FieldNavPortlet() -> impl IntoView {
     let ctx = expect_context::<ReadSignal<Option<FieldNavCtx>>>();
-    move || {
-        let ctx = ctx.get();
-        ctx.map(|ctx| {
-            view! {
-                <div id="FieldNavPortlet">
-                    <span>"FieldNavPortlet:"</span>
-                    <nav>
-                        {ctx
-                            .0
-                            .map(|ctx| {
-                                ctx.into_iter()
-                                    .map(|FieldNavItem { href, text }| {
-                                        view! { <A href=href>{text}</A> }
-                                    })
-                                    .collect_view()
-                            })}
-                    </nav>
-                </div>
-            }
-        })
+
+    view! {
+        <ShowLet some=ctx let:ctx>
+            <div id="FieldNavPortlet">
+                <span>"FieldNavPortlet:"</span>
+                <nav>
+                    {ctx
+                        .0
+                        .map(|ctx| {
+                            ctx.into_iter()
+                                .map(|FieldNavItem { href, text }| {
+                                    view! { <A href=href>{text}</A> }
+                                })
+                                .collect_view()
+                        })}
+                </nav>
+            </div>
+        </ShowLet>
     }
 }
 

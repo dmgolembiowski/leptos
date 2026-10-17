@@ -1,23 +1,32 @@
-use crate::{children::TypedChildren, IntoView};
+use crate::{IntoView, children::TypedChildren};
+use futures::{channel::oneshot, future::join_all};
 use hydration_context::{SerializedDataId, SharedContext};
 use leptos_macro::component;
+use or_poisoned::OrPoisoned;
 use reactive_graph::{
     computed::ArcMemo,
     effect::RenderEffect,
-    owner::{provide_context, Owner},
+    owner::{ArcStoredValue, Owner, provide_context},
     signal::ArcRwSignal,
-    traits::{Get, Update, With, WithUntracked},
+    traits::{Get, Update, With, WithUntracked, WriteValue},
 };
 use rustc_hash::FxHashMap;
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fmt::Debug,
+    mem,
+    sync::{Arc, Mutex},
+};
+#[cfg(erase_components)]
+use tachys::view::any_view::{AnyView, IntoMaybeErased};
 use tachys::{
-    html::attribute::{any_attribute::AnyAttribute, Attribute},
+    html::attribute::{Attribute, any_attribute::AnyAttribute},
     hydration::Cursor,
     reactive_graph::OwnedView,
-    ssr::StreamBuilder,
+    ssr::{StreamBuilder, StreamChunk},
     view::{
-        add_attr::AddAnyAttr, Mountable, Position, PositionState, Render,
-        RenderHtml,
+        Mountable, Position, PositionState, Render, RenderFlags, RenderHtml,
+        add_attr::AddAnyAttr,
     },
 };
 use throw_error::{Error, ErrorHook, ErrorId};
@@ -80,7 +89,10 @@ where
     Chil: IntoView + Send + 'static,
 {
     let sc = Owner::current_shared_context();
-    let boundary_id = sc.as_ref().map(|sc| sc.next_id()).unwrap_or_default();
+    let boundary_id = sc
+        .as_ref()
+        .map(|sc| Owner::next_serialized_data_id(&**sc))
+        .unwrap_or_default();
     let initial_errors =
         sc.map(|sc| sc.errors(&boundary_id)).unwrap_or_default();
 
@@ -96,12 +108,27 @@ where
     let hook = hook as Arc<dyn ErrorHook>;
 
     let _guard = throw_error::set_error_hook(Arc::clone(&hook));
+    let suspended_children = ErrorBoundarySuspendedChildren::default();
 
     let owner = Owner::new();
     let children = owner.with(|| {
         provide_context(Arc::clone(&hook));
-        children.into_inner()()
+        provide_context(suspended_children.clone());
+        #[cfg(erase_components)]
+        {
+            children.into_inner()().into_maybe_erased()
+        }
+        #[cfg(not(erase_components))]
+        {
+            children.into_inner()()
+        }
     });
+
+    #[cfg(erase_components)]
+    let mut fallback = fallback;
+    #[cfg(erase_components)]
+    let fallback: Box<dyn FnMut(ArcRwSignal<Errors>) -> AnyView + Send> =
+        Box::new(move |errors| fallback(errors).into_maybe_erased());
 
     OwnedView::new_with_owner(
         ErrorBoundaryView {
@@ -111,10 +138,14 @@ where
             children,
             errors,
             fallback,
+            suspended_children,
         },
         owner,
     )
 }
+
+pub(crate) type ErrorBoundarySuspendedChildren =
+    ArcStoredValue<Vec<oneshot::Receiver<()>>>;
 
 struct ErrorBoundaryView<Chil, FalFn> {
     hook: Arc<dyn ErrorHook>,
@@ -123,6 +154,7 @@ struct ErrorBoundaryView<Chil, FalFn> {
     children: Chil,
     fallback: FalFn,
     errors: ArcRwSignal<Errors>,
+    suspended_children: ErrorBoundarySuspendedChildren,
 }
 
 struct ErrorBoundaryViewState<Chil, Fal> {
@@ -257,6 +289,7 @@ where
             children,
             fallback,
             errors,
+            suspended_children,
         } = self;
         ErrorBoundaryView {
             hook,
@@ -265,6 +298,7 @@ where
             children: children.add_any_attr(attr.into_cloneable_owned()),
             fallback,
             errors,
+            suspended_children,
         }
     }
 }
@@ -292,6 +326,7 @@ where
             children,
             fallback,
             errors,
+            suspended_children,
             ..
         } = self;
         ErrorBoundaryView {
@@ -301,6 +336,7 @@ where
             children: children.resolve().await,
             fallback,
             errors,
+            suspended_children,
         }
     }
 
@@ -308,73 +344,128 @@ where
         mut self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         // first, attempt to serialize the children to HTML, then check for errors
         let _hook = throw_error::set_error_hook(self.hook);
-        let mut new_buf = String::with_capacity(Chil::MIN_LENGTH);
+        // Render children straight into `buf`. If a child throws, roll back to
+        // this marker (`String::truncate` keeps the reserved capacity) and emit
+        // the fallback instead. This avoids the scratch `String` allocation plus
+        // a full second pass copying the whole subtree on the common no-error path.
+        let marker = buf.len();
         let mut new_pos = *position;
         self.children.to_html_with_buf(
-            &mut new_buf,
+            buf,
             &mut new_pos,
-            escape,
-            mark_branches,
+            flags,
             extra_attrs.clone(),
         );
 
-        // any thrown errors would've been caught here
-        if self.errors.with_untracked(|map| map.is_empty()) {
-            buf.push_str(&new_buf);
-        } else {
-            // otherwise, serialize the fallback instead
+        // any thrown errors would've been caught here; on error, discard the
+        // children bytes and serialize the fallback instead
+        if !self.errors.with_untracked(|map| map.is_empty()) {
+            buf.truncate(marker);
             (self.fallback)(self.errors).to_html_with_buf(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs,
             );
         }
+        // happy path: children are already in `buf`; nothing to copy. `*position`
+        // is intentionally left unchanged, matching prior behavior.
     }
 
     fn to_html_async_with_buf<const OUT_OF_ORDER: bool>(
         mut self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
     {
-        let _hook = throw_error::set_error_hook(self.hook);
+        let _hook = throw_error::set_error_hook(Arc::clone(&self.hook));
+
         // first, attempt to serialize the children to HTML, then check for errors
         let mut new_buf = StreamBuilder::new(buf.clone_id());
         let mut new_pos = *position;
         self.children.to_html_async_with_buf::<OUT_OF_ORDER>(
             &mut new_buf,
             &mut new_pos,
-            escape,
-            mark_branches,
+            flags,
             extra_attrs.clone(),
         );
 
-        // any thrown errors would've been caught here
-        if self.errors.with_untracked(|map| map.is_empty()) {
-            buf.append(new_buf);
+        let suspense_children =
+            mem::take(&mut *self.suspended_children.write_value());
+
+        // not waiting for any suspended children: just render
+        if suspense_children.is_empty() {
+            // any thrown errors would've been caught here
+            if self.errors.with_untracked(|map| map.is_empty()) {
+                buf.append(new_buf);
+            } else {
+                // otherwise, serialize the fallback instead
+                let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
+                (self.fallback)(self.errors).to_html_with_buf(
+                    &mut fallback,
+                    position,
+                    flags,
+                    extra_attrs,
+                );
+                buf.push_sync(&fallback);
+            }
         } else {
-            // otherwise, serialize the fallback instead
-            let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
-            (self.fallback)(self.errors).to_html_with_buf(
-                &mut fallback,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs,
-            );
-            buf.push_sync(&fallback);
+            let mut position = *position;
+            // if we're waiting for suspended children, we'll first wait for them to load
+            // in this implementation, an ErrorBoundary that *contains* Suspense essentially acts
+            // like a Suspense: it will wait for (all top-level) child Suspense to load before rendering anything
+            let mut view_buf = StreamBuilder::new(new_buf.clone_id());
+            view_buf.next_id();
+            let hook = Arc::clone(&self.hook);
+            view_buf.push_async(async move {
+                let _hook = throw_error::set_error_hook(Arc::clone(&hook));
+                let _ = join_all(suspense_children).await;
+
+                let mut my_chunks = VecDeque::new();
+                for chunk in new_buf.take_chunks() {
+                    match chunk {
+                        StreamChunk::Sync(data) => {
+                            my_chunks.push_back(StreamChunk::Sync(data))
+                        }
+                        StreamChunk::Async { chunks } => {
+                            let chunks = chunks.await;
+                            my_chunks.extend(chunks);
+                        }
+                        StreamChunk::OutOfOrder { chunks } => {
+                            let chunks = chunks.await;
+                            my_chunks.push_back(StreamChunk::OutOfOrder {
+                                chunks: Box::pin(async move { chunks }),
+                            });
+                        }
+                    }
+                }
+
+                if self.errors.with_untracked(|map| map.is_empty()) {
+                    // if no errors, just go ahead with the stream
+                    my_chunks
+                } else {
+                    // otherwise, serialize the fallback instead
+                    let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
+                    (self.fallback)(self.errors).to_html_with_buf(
+                        &mut fallback,
+                        &mut position,
+                        flags,
+                        extra_attrs,
+                    );
+                    my_chunks.clear();
+                    my_chunks.push_back(StreamChunk::Sync(fallback));
+                    my_chunks
+                }
+            });
+            buf.append(view_buf);
         }
     }
 
@@ -439,6 +530,79 @@ where
         )
     }
 
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let mut children = Some(self.children);
+        let hook = Arc::clone(&self.hook);
+        let cursor = cursor.to_owned();
+        let position = position.to_owned();
+
+        let fallback_fn = Arc::new(Mutex::new(self.fallback));
+        let initial = {
+            let errors_empty = self.errors_empty.clone();
+            let errors = self.errors.clone();
+            let fallback_fn = Arc::clone(&fallback_fn);
+            async move {
+                let children = children.take().unwrap();
+                let (children, fallback) = if errors_empty.get() {
+                    (children.hydrate_async(&cursor, &position).await, None)
+                } else {
+                    let children = children.build();
+                    let fallback =
+                        (fallback_fn.lock().or_poisoned())(errors.clone());
+                    let fallback =
+                        fallback.hydrate_async(&cursor, &position).await;
+                    (children, Some(fallback))
+                };
+
+                ErrorBoundaryViewState { children, fallback }
+            }
+        };
+
+        RenderEffect::new_with_async_value(
+            move |prev: Option<
+                ErrorBoundaryViewState<Chil::State, Fal::State>,
+            >| {
+                let _hook = throw_error::set_error_hook(Arc::clone(&hook));
+                if let Some(mut state) = prev {
+                    match (self.errors_empty.get(), &mut state.fallback) {
+                        // no errors, and was showing fallback
+                        (true, Some(fallback)) => {
+                            fallback.insert_before_this(&mut state.children);
+                            state.fallback.unmount();
+                            state.fallback = None;
+                        }
+                        // yes errors, and was showing children
+                        (false, None) => {
+                            state.fallback = Some(
+                                (fallback_fn.lock().or_poisoned())(
+                                    self.errors.clone(),
+                                )
+                                .build(),
+                            );
+                            state
+                                .children
+                                .insert_before_this(&mut state.fallback);
+                            state.children.unmount();
+                        }
+                        // either there were no errors, and we were already showing the children
+                        // or there are errors, but we were already showing the fallback
+                        // in either case, rebuilding doesn't require us to do anything
+                        _ => {}
+                    }
+                    state
+                } else {
+                    unreachable!()
+                }
+            },
+            initial,
+        )
+        .await
+    }
+
     fn into_owned(self) -> Self::Owned {
         self
     }
@@ -470,7 +634,7 @@ impl ErrorHook for ErrorBoundaryErrorHook {
     fn throw(&self, error: Error) -> ErrorId {
         // generate a unique ID
         let key: ErrorId = Owner::current_shared_context()
-            .map(|sc| sc.next_id())
+            .map(|sc| Owner::next_serialized_data_id(&*sc))
             .unwrap_or_default()
             .into();
 

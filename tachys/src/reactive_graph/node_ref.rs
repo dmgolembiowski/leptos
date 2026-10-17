@@ -3,12 +3,12 @@ use reactive_graph::{
     effect::Effect,
     graph::untrack,
     signal::{
-        guards::{Derefable, ReadGuard},
         RwSignal,
+        guards::{Derefable, ReadGuard},
     },
     traits::{
-        DefinedAt, Get, Notify, ReadUntracked, Set, Track, UntrackableGuard,
-        Write,
+        DefinedAt, Get, IsDisposed, Notify, ReadUntracked, Set, Track,
+        UntrackableGuard, Write,
     },
 };
 use send_wrapper::SendWrapper;
@@ -155,6 +155,16 @@ where
 {
     fn track(&self) {
         self.0.track();
+    }
+}
+
+impl<E> IsDisposed for NodeRef<E>
+where
+    E: ElementType,
+    E::Output: 'static,
+{
+    fn is_disposed(&self) -> bool {
+        self.0.is_disposed()
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::{
     html::attribute::{
-        maybe_next_attr_erasure_macros::next_attr_combine, Attribute,
+        Attribute, NamedAttributeKey,
+        maybe_next_attr_erasure_macros::next_attr_combine,
     },
     renderer::{CastFrom, RemoveEventHandler, Rndr},
     view::{Position, ToTemplate},
@@ -68,7 +69,6 @@ impl<E, T> Targeted<E, T> {
     pub fn target(&self) -> T
     where
         T: CastFrom<crate::renderer::types::Element>,
-
         crate::renderer::types::Event: From<E>,
         E: Clone,
     {
@@ -101,6 +101,7 @@ impl<E, T> From<E> for Targeted<E, T> {
 }
 
 /// Creates an [`Attribute`] that will add an event listener to an element.
+#[cfg(not(erase_components))]
 pub fn on<E, F>(event: E, cb: F) -> On<E, F>
 where
     F: FnMut(E::EventType) + 'static,
@@ -110,7 +111,41 @@ where
 {
     On {
         event,
-        cb: Some(SendWrapper::new(cb)),
+        #[cfg(feature = "reactive_graph")]
+        owner: reactive_graph::owner::Owner::current().unwrap_or_default(),
+        cb: (!cfg!(feature = "ssr")).then(|| SendWrapper::new(cb)),
+    }
+}
+
+/// Creates an [`Attribute`] that will add an event listener to an element.
+#[cfg(erase_components)]
+#[allow(clippy::type_complexity)]
+pub fn on<E, F>(event: E, cb: F) -> On<E, Box<dyn FnMut(E::EventType)>>
+where
+    F: FnMut(E::EventType) + 'static,
+    E: EventDescriptor + Send + 'static,
+    E::EventType: 'static,
+    E::EventType: From<crate::renderer::types::Event>,
+{
+    on_erased(event, Box::new(cb))
+}
+
+#[cfg(erase_components)]
+#[allow(clippy::type_complexity)]
+fn on_erased<E>(
+    event: E,
+    cb: Box<dyn FnMut(E::EventType)>,
+) -> On<E, Box<dyn FnMut(E::EventType)>>
+where
+    E: EventDescriptor + Send + 'static,
+    E::EventType: 'static,
+    E::EventType: From<crate::renderer::types::Event>,
+{
+    On {
+        event,
+        #[cfg(feature = "reactive_graph")]
+        owner: reactive_graph::owner::Owner::current().unwrap_or_default(),
+        cb: (!cfg!(feature = "ssr")).then(|| SendWrapper::new(cb)),
     }
 }
 
@@ -126,15 +161,23 @@ where
         + 'static,
     E: EventDescriptor + Send + 'static,
     E::EventType: 'static,
-
     E::EventType: From<crate::renderer::types::Event>,
 {
-    on(event, Box::new(move |ev: E::EventType| cb(ev.into())))
+    #[cfg(erase_components)]
+    {
+        on_erased(event, Box::new(move |ev: E::EventType| cb(ev.into())))
+    }
+    #[cfg(not(erase_components))]
+    {
+        on(event, Box::new(move |ev: E::EventType| cb(ev.into())))
+    }
 }
 
 /// An [`Attribute`] that adds an event listener to an element.
 pub struct On<E, F> {
     event: E,
+    #[cfg(feature = "reactive_graph")]
+    owner: reactive_graph::owner::Owner,
     cb: Option<SendWrapper<F>>,
 }
 
@@ -146,6 +189,8 @@ where
     fn clone(&self) -> Self {
         Self {
             event: self.event.clone(),
+            #[cfg(feature = "reactive_graph")]
+            owner: self.owner.clone(),
             cb: self.cb.clone(),
         }
     }
@@ -180,7 +225,7 @@ where
             }
         }
 
-        let mut cb = self.cb.expect("callback removed before attaching").take();
+        let mut cb = self.cb.expect(super::FEATURE_CONFLICT_DIAGNOSTIC).take();
 
         #[cfg(feature = "tracing")]
         let span = tracing::Span::current();
@@ -193,6 +238,10 @@ where
             let _tracing_guard = span.enter();
 
             let ev = E::EventType::from(ev);
+
+            #[cfg(feature = "reactive_graph")]
+            self.owner.with(|| cb.invoke(ev));
+            #[cfg(not(feature = "reactive_graph"))]
             cb.invoke(ev);
         }) as Box<dyn FnMut(crate::renderer::types::Event)>;
 
@@ -219,7 +268,7 @@ where
             Rndr::add_event_listener_use_capture(el, &name, cb)
         }
 
-        let mut cb = self.cb.expect("callback removed before attaching").take();
+        let mut cb = self.cb.expect(super::FEATURE_CONFLICT_DIAGNOSTIC).take();
 
         #[cfg(feature = "tracing")]
         let span = tracing::Span::current();
@@ -232,6 +281,10 @@ where
             let _tracing_guard = span.enter();
 
             let ev = E::EventType::from(ev);
+
+            #[cfg(feature = "reactive_graph")]
+            self.owner.with(|| cb.invoke(ev));
+            #[cfg(not(feature = "reactive_graph"))]
             cb.invoke(ev);
         }) as Box<dyn FnMut(crate::renderer::types::Event)>;
 
@@ -253,7 +306,6 @@ where
     F: EventCallback<E::EventType>,
     E: EventDescriptor + Send + 'static,
     E::EventType: 'static,
-
     E::EventType: From<crate::renderer::types::Event>,
 {
     const MIN_LENGTH: usize = 0;
@@ -307,8 +359,10 @@ where
     #[inline(always)]
     fn rebuild(self, state: &mut Self::State) {
         let (el, prev_cleanup) = state;
-        if let Some(prev) = prev_cleanup.take() {
-            (prev.into_inner())(el);
+        if let Some(prev) = prev_cleanup.take()
+            && let Some(remove) = prev.into_inner()
+        {
+            remove();
         }
         *prev_cleanup = Some(if E::CAPTURE {
             self.attach_capture(el)
@@ -320,6 +374,8 @@ where
     fn into_cloneable(self) -> Self::Cloneable {
         On {
             cb: self.cb.map(|cb| SendWrapper::new(cb.take().into_shared())),
+            #[cfg(feature = "reactive_graph")]
+            owner: self.owner,
             event: self.event,
         }
     }
@@ -327,20 +383,20 @@ where
     fn into_cloneable_owned(self) -> Self::CloneableOwned {
         On {
             cb: self.cb.map(|cb| SendWrapper::new(cb.take().into_shared())),
+            #[cfg(feature = "reactive_graph")]
+            owner: self.owner,
             event: self.event,
         }
     }
 
-    fn dry_resolve(&mut self) {
-        // dry_resolve() only runs during SSR, and we should use it to
-        // synchronously remove and drop the SendWrapper value
-        // we don't need this value during SSR and leaving it here could drop it
-        // from a different thread
-        self.cb.take();
-    }
+    fn dry_resolve(&mut self) {}
 
     async fn resolve(self) -> Self::AsyncOutput {
         self
+    }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![]
     }
 }
 
@@ -349,7 +405,6 @@ where
     F: EventCallback<E::EventType>,
     E: EventDescriptor + Send + 'static,
     E::EventType: 'static,
-
     E::EventType: From<crate::renderer::types::Event>,
 {
     next_attr_output_type!(Self, NewAttr);
@@ -589,7 +644,7 @@ generate_event_types! {
   animation start: AnimationEvent,
   aux click: MouseEvent,
   before input: InputEvent,
-  before toggle: Event, // web_sys does not include `ToggleEvent`
+  before toggle: ToggleEvent,
   #[does_not_bubble]
   blur: FocusEvent,
   #[does_not_bubble]
@@ -700,7 +755,7 @@ generate_event_types! {
   #[does_not_bubble]
   time update: Event,
   #[does_not_bubble]
-  toggle: Event,
+  toggle: ToggleEvent,
   touch cancel: TouchEvent,
   touch end: TouchEvent,
   touch move: TouchEvent,
@@ -733,9 +788,9 @@ generate_event_types! {
   // =========================================================
   // DocumentAndElementEventHandlersEventMap
   // =========================================================
-  copy: Event, // ClipboardEvent is unstable
-  cut: Event, // ClipboardEvent is unstable
-  paste: Event, // ClipboardEvent is unstable
+  copy: ClipboardEvent,
+  cut: ClipboardEvent,
+  paste: ClipboardEvent,
 
   // =========================================================
   // DocumentEventMap
@@ -752,17 +807,17 @@ generate_event_types! {
 // Export `web_sys` event types
 use super::{
     attribute::{
-        maybe_next_attr_erasure_macros::next_attr_output_type, NextAttribute,
+        NextAttribute, maybe_next_attr_erasure_macros::next_attr_output_type,
     },
     element::HasElementType,
 };
 #[doc(no_inline)]
 pub use web_sys::{
-    AnimationEvent, BeforeUnloadEvent, CompositionEvent, CustomEvent,
-    DeviceMotionEvent, DeviceOrientationEvent, DragEvent, ErrorEvent, Event,
-    FocusEvent, GamepadEvent, HashChangeEvent, InputEvent, KeyboardEvent,
-    MessageEvent, MouseEvent, PageTransitionEvent, PointerEvent, PopStateEvent,
-    ProgressEvent, PromiseRejectionEvent, SecurityPolicyViolationEvent,
-    StorageEvent, SubmitEvent, TouchEvent, TransitionEvent, UiEvent,
-    WheelEvent,
+    AnimationEvent, BeforeUnloadEvent, ClipboardEvent, CompositionEvent,
+    CustomEvent, DeviceMotionEvent, DeviceOrientationEvent, DragEvent,
+    ErrorEvent, Event, FocusEvent, GamepadEvent, HashChangeEvent, InputEvent,
+    KeyboardEvent, MessageEvent, MouseEvent, PageTransitionEvent, PointerEvent,
+    PopStateEvent, ProgressEvent, PromiseRejectionEvent,
+    SecurityPolicyViolationEvent, StorageEvent, SubmitEvent, TouchEvent,
+    TransitionEvent, UiEvent, WheelEvent,
 };

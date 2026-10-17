@@ -1,25 +1,30 @@
 use crate::{
-    children::{TypedChildren, ViewFnOnce},
-    suspense_component::SuspenseBoundary,
     IntoView,
+    children::{TypedChildren, ViewFnOnce},
+    error::ErrorBoundarySuspendedChildren,
+    suspense_component::SuspenseBoundary,
 };
+use hydration_context::SerializedDataIdScope;
 use leptos_macro::component;
 use reactive_graph::{
-    computed::{suspense::SuspenseContext, ArcMemo},
+    computed::{ArcMemo, suspense::SuspenseContext},
     effect::Effect,
-    owner::{provide_context, Owner},
+    owner::{Owner, provide_context, use_context},
     signal::ArcRwSignal,
-    traits::{Get, Set, Track, With},
+    traits::{Get, Set, Track, With, WithUntracked},
     wrappers::write::SignalSetter,
 };
 use slotmap::{DefaultKey, SlotMap};
+use std::sync::Arc;
 use tachys::reactive_graph::OwnedView;
+#[cfg(erase_components)]
+use tachys::view::any_view::IntoMaybeErased;
 
-/// If any [`Resource`](leptos_reactive::Resource) is read in the `children` of this
+/// If any [`Resource`](crate::prelude::Resource) is read in the `children` of this
 /// component, it will show the `fallback` while they are loading. Once all are resolved,
 /// it will render the `children`.
 ///
-/// Unlike [`Suspense`](crate::Suspense), this will not fall
+/// Unlike [`Suspense`](crate::prelude::Suspense), this will not fall
 /// back to the `fallback` state if there are further changes after the initial load.
 ///
 /// Note that the `children` will be rendered initially (in order to capture the fact that
@@ -81,34 +86,50 @@ pub fn Transition<Chil>(
     #[prop(optional, into)]
     set_pending: Option<SignalSetter<bool>>,
     children: TypedChildren<Chil>,
+    /// If `true`, disables the SSR "double-check" pass that re-walks the
+    /// children after initial resources resolve in order to discover
+    /// conditional/nested resource reads. Enable this when the children body
+    /// has no conditional resource reads but does have side effects that
+    /// should not fire more than once per render.
+    #[prop(optional)]
+    strict: bool,
 ) -> impl IntoView
 where
     Chil: IntoView + Send + 'static,
 {
+    let error_boundary_parent = use_context::<ErrorBoundarySuspendedChildren>();
+
     let owner = Owner::new();
     owner.with(|| {
         let (starts_local, id) = {
             Owner::current_shared_context()
                 .map(|sc| {
-                    let id = sc.next_id();
+                    let id = Owner::next_serialized_data_id(&*sc);
+                    provide_context(SerializedDataIdScope::new(id.clone()));
                     (sc.get_incomplete_chunk(&id), id)
                 })
                 .unwrap_or_else(|| (false, Default::default()))
         };
         let fallback = fallback.run();
+        #[cfg(erase_components)]
+        let children = children.into_inner()().into_maybe_erased();
+        #[cfg(not(erase_components))]
         let children = children.into_inner()();
         let tasks = ArcRwSignal::new(SlotMap::<DefaultKey, ()>::new());
-        provide_context(SuspenseContext {
-            tasks: tasks.clone(),
-        });
-        let none_pending = ArcMemo::new(move |prev: Option<&bool>| {
-            tasks.track();
-            if prev.is_none() && starts_local {
-                false
-            } else {
-                tasks.with(SlotMap::is_empty)
+        provide_context(SuspenseContext::new(tasks.clone()));
+        let none_pending = ArcMemo::new({
+            let tasks = tasks.clone();
+            move |prev: Option<&bool>| {
+                tasks.track();
+                if prev.is_none() && starts_local {
+                    false
+                } else {
+                    tasks.with(SlotMap::is_empty)
+                }
             }
         });
+        let has_tasks =
+            Arc::new(move || !tasks.with_untracked(SlotMap::is_empty));
         if let Some(set_pending) = set_pending {
             Effect::new_isomorphic({
                 let none_pending = none_pending.clone();
@@ -123,6 +144,9 @@ where
             none_pending,
             fallback,
             children,
+            error_boundary_parent,
+            has_tasks,
+            strict,
         })
     })
 }

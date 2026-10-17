@@ -1,7 +1,9 @@
-//! The reactive ownership model, which manages effect cancelation, cleanups, and arena allocation.
+//! The reactive ownership model, which manages effect cancellation, cleanups, and arena allocation.
 
 #[cfg(feature = "hydration")]
-use hydration_context::SharedContext;
+use hydration_context::{
+    SerializedDataId, SerializedDataIdScope, SharedContext,
+};
 use or_poisoned::OrPoisoned;
 use rustc_hash::FxHashMap;
 use std::{
@@ -21,18 +23,18 @@ mod stored_value;
 use self::arena::Arena;
 pub use arc_stored_value::ArcStoredValue;
 #[cfg(feature = "sandboxed-arenas")]
-pub use arena::sandboxed::Sandboxed;
-#[cfg(feature = "sandboxed-arenas")]
 use arena::ArenaMap;
 use arena::NodeId;
+#[cfg(feature = "sandboxed-arenas")]
+pub use arena::sandboxed::Sandboxed;
 pub use arena_item::*;
 pub use context::*;
 pub use storage::*;
 #[allow(deprecated)] // allow exporting deprecated fn
-pub use stored_value::{store_value, FromLocal, StoredValue};
+pub use stored_value::{FromLocal, StoredValue, store_value};
 
 /// A reactive owner, which manages
-/// 1) the cancelation of [`Effect`](crate::effect::Effect)s,
+/// 1) the cancellation of [`Effect`](crate::effect::Effect)s,
 /// 2) providing and accessing environment data via [`provide_context`] and [`use_context`],
 /// 3) running cleanup functions defined via [`Owner::on_cleanup`], and
 /// 4) an arena storage system to provide `Copy` handles via [`ArenaItem`], which is what allows
@@ -60,6 +62,46 @@ pub struct Owner {
     pub(crate) shared_context: Option<Arc<dyn SharedContext + Send + Sync>>,
 }
 
+impl Owner {
+    /// Creates a [`WeakOwner`] reference to this owner that does not prevent cleanup.
+    pub fn downgrade(&self) -> WeakOwner {
+        WeakOwner {
+            inner: Arc::downgrade(&self.inner),
+            #[cfg(feature = "hydration")]
+            shared_context: self.shared_context.as_ref().map(Arc::downgrade),
+        }
+    }
+}
+
+/// A weak reference to an [`Owner`] that does not prevent cleanup.
+///
+/// This is useful for capturing an owner reference without creating reference
+/// cycles that would prevent the owner from being dropped and cleaned up.
+#[derive(Clone)]
+pub struct WeakOwner {
+    inner: Weak<RwLock<OwnerInner>>,
+    #[cfg(feature = "hydration")]
+    shared_context: Option<Weak<dyn SharedContext + Send + Sync>>,
+}
+
+impl WeakOwner {
+    /// Attempts to upgrade this weak reference to a strong [`Owner`].
+    ///
+    /// Returns `None` if the owner has already been dropped.
+    pub fn upgrade(&self) -> Option<Owner> {
+        self.inner.upgrade().map(|inner| {
+            #[cfg(feature = "hydration")]
+            let shared_context =
+                self.shared_context.as_ref().and_then(|sc| sc.upgrade());
+            Owner {
+                inner,
+                #[cfg(feature = "hydration")]
+                shared_context,
+            }
+        })
+    }
+}
+
 impl PartialEq for Owner {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -67,7 +109,7 @@ impl PartialEq for Owner {
 }
 
 thread_local! {
-    static OWNER: RefCell<Option<Owner>> = Default::default();
+    static OWNER: RefCell<Option<WeakOwner>> = Default::default();
 }
 
 impl Owner {
@@ -107,12 +149,16 @@ impl Owner {
     /// Creates a new `Owner` and registers it as a child of the current `Owner`, if there is one.
     pub fn new() -> Self {
         #[cfg(not(feature = "hydration"))]
-        let parent = OWNER
-            .with(|o| o.borrow().as_ref().map(|o| Arc::downgrade(&o.inner)));
+        let parent = OWNER.with(|o| {
+            o.borrow()
+                .as_ref()
+                .and_then(|o| o.upgrade())
+                .map(|o| Arc::downgrade(&o.inner))
+        });
         #[cfg(feature = "hydration")]
         let (parent, shared_context) = OWNER
             .with(|o| {
-                o.borrow().as_ref().map(|o| {
+                o.borrow().as_ref().and_then(|o| o.upgrade()).map(|o| {
                     (Some(Arc::downgrade(&o.inner)), o.shared_context.clone())
                 })
             })
@@ -173,6 +219,25 @@ impl Owner {
         this
     }
 
+    /// Returns the parent of this `Owner`, if any.
+    ///
+    /// None when:
+    /// - This is a root owner
+    /// - The parent has been dropped
+    pub fn parent(&self) -> Option<Owner> {
+        self.inner
+            .read()
+            .or_poisoned()
+            .parent
+            .as_ref()
+            .and_then(|p| p.upgrade())
+            .map(|inner| Owner {
+                inner,
+                #[cfg(feature = "hydration")]
+                shared_context: self.shared_context.clone(),
+            })
+    }
+
     /// Creates a new `Owner` that is the child of the current `Owner`, if any.
     pub fn child(&self) -> Self {
         let parent = Some(Arc::downgrade(&self.inner));
@@ -194,13 +259,23 @@ impl Owner {
             #[cfg(feature = "hydration")]
             shared_context: self.shared_context.clone(),
         };
+        // When the children list is about to grow its allocation, drop the
+        // `Weak`s whose owners have already been dropped. `children` is
+        // otherwise append-only, so a long-lived parent would accumulate dead
+        // weak refs without bound and pay for walking them on cleanup. Pruning
+        // only at a reallocation boundary keeps this amortized O(1).
+        if !inner.children.is_empty()
+            && inner.children.len() == inner.children.capacity()
+        {
+            inner.children.retain(|child| child.strong_count() > 0);
+        }
         inner.children.push(Arc::downgrade(&child.inner));
         child
     }
 
     /// Sets this as the current `Owner`.
     pub fn set(&self) {
-        OWNER.with_borrow_mut(|owner| *owner = Some(self.clone()));
+        OWNER.with_borrow_mut(|owner| *owner = Some(self.downgrade()));
         #[cfg(feature = "sandboxed-arenas")]
         Arena::set(&self.inner.read().or_poisoned().arena);
     }
@@ -208,9 +283,8 @@ impl Owner {
     /// Runs the given function with this as the current `Owner`.
     pub fn with<T>(&self, fun: impl FnOnce() -> T) -> T {
         // codegen optimisation:
-        fn inner_1(self_: &Owner) -> Option<Owner> {
-            let prev =
-                { OWNER.with(|o| (*o.borrow_mut()).replace(self_.clone())) };
+        fn inner_1(self_: &Owner) -> Option<WeakOwner> {
+            let prev = OWNER.with_borrow_mut(|o| o.replace(self_.downgrade()));
             #[cfg(feature = "sandboxed-arenas")]
             Arena::set(&self_.inner.read().or_poisoned().arena);
             prev
@@ -220,10 +294,8 @@ impl Owner {
         let val = fun();
 
         // monomorphisation optimisation:
-        fn inner_2(prev: Option<Owner>) {
-            OWNER.with(|o| {
-                *o.borrow_mut() = prev;
-            });
+        fn inner_2(prev: Option<WeakOwner>) {
+            OWNER.with_borrow_mut(|o| *o = prev);
         }
         inner_2(prev);
 
@@ -251,22 +323,50 @@ impl Owner {
     /// fill the same need as an "on unmount" function in other UI approaches, etc.
     pub fn on_cleanup(fun: impl FnOnce() + Send + Sync + 'static) {
         if let Some(owner) = Owner::current() {
-            owner
-                .inner
-                .write()
-                .or_poisoned()
-                .cleanups
-                .push(Box::new(fun));
+            let mut inner = owner.inner.write().or_poisoned();
+
+            #[cfg(feature = "sandboxed-arenas")]
+            let fun = {
+                let arena = Arc::clone(&inner.arena);
+                move || {
+                    Arena::set(&arena);
+                    fun()
+                }
+            };
+
+            inner.cleanups.push(Box::new(fun));
         }
     }
 
     fn register(&self, node: NodeId) {
-        self.inner.write().or_poisoned().nodes.push(node);
+        let mut inner = self.inner.write().or_poisoned();
+        // When the node list is about to grow its allocation, drop the ids
+        // whose arena entries have already been disposed. `ArenaItem::dispose`
+        // removes the arena entry but cannot reach back into the owner, so
+        // without this a long-lived owner that allocates and disposes many
+        // values would accumulate dead ids unboundedly. Pruning only at a
+        // reallocation boundary keeps this amortized O(1) and bounds `nodes` to
+        // roughly the live set.
+        if !inner.nodes.is_empty()
+            && inner.nodes.len() == inner.nodes.capacity()
+        {
+            #[cfg(not(feature = "sandboxed-arenas"))]
+            Arena::with(|arena| {
+                inner.nodes.retain(|n| arena.contains_key(*n));
+            });
+            #[cfg(feature = "sandboxed-arenas")]
+            {
+                let arena = Arc::clone(&inner.arena);
+                let arena = arena.read().or_poisoned();
+                inner.nodes.retain(|n| arena.contains_key(*n));
+            }
+        }
+        inner.nodes.push(node);
     }
 
     /// Returns the current `Owner`, if any.
     pub fn current() -> Option<Owner> {
-        OWNER.with(|o| o.borrow().clone())
+        OWNER.with(|o| o.borrow().as_ref().and_then(|n| n.upgrade()))
     }
 
     /// Returns the [`SharedContext`] associated with this owner, if any.
@@ -278,23 +378,60 @@ impl Owner {
     }
 
     /// Removes this from its state as the thread-local owner and drops it.
+    /// If there are other holders of this owner, it may not cleanup, if always cleaning up is required,
+    /// see [`Owner::unset_with_forced_cleanup`].
     pub fn unset(self) {
         OWNER.with_borrow_mut(|owner| {
-            if owner.as_ref() == Some(&self) {
+            if owner.as_ref().and_then(|n| n.upgrade()) == Some(self) {
                 mem::take(owner);
             }
         })
     }
 
+    /// Removes this from its state as the thread-local owner and drops it.
+    /// Unlike [`Owner::unset`], this will always run cleanup on this owner,
+    /// even if there are other holders of this owner.
+    pub fn unset_with_forced_cleanup(self) {
+        OWNER.with_borrow_mut(|owner| {
+            if owner
+                .as_ref()
+                .and_then(|n| n.upgrade())
+                .map(|o| o == self)
+                .unwrap_or(false)
+            {
+                mem::take(owner);
+            }
+        });
+        self.cleanup();
+    }
+
     /// Returns the current [`SharedContext`], if any.
     #[cfg(feature = "hydration")]
-    pub fn current_shared_context(
-    ) -> Option<Arc<dyn SharedContext + Send + Sync>> {
+    pub fn current_shared_context()
+    -> Option<Arc<dyn SharedContext + Send + Sync>> {
         OWNER.with(|o| {
             o.borrow()
                 .as_ref()
+                .and_then(|o| o.upgrade())
                 .and_then(|current| current.shared_context.clone())
         })
+    }
+
+    /// Returns the next [`SerializedDataId`] from the given [`SharedContext`].
+    ///
+    /// If a [`SerializedDataIdScope`] has been provided via context (for example, by a
+    /// `<Suspense/>` boundary), the ID will be allocated from that scope.
+    #[cfg(feature = "hydration")]
+    pub fn next_serialized_data_id(
+        shared_context: &(dyn SharedContext + Send + Sync),
+    ) -> SerializedDataId {
+        if shared_context.get_is_hydrating()
+            && let Some(scope) = use_context::<SerializedDataIdScope>()
+        {
+            scope.next_id()
+        } else {
+            shared_context.next_id()
+        }
     }
 
     /// Runs the given function, after indicating that the current [`SharedContext`] should be
@@ -306,6 +443,7 @@ impl Owner {
 
             let sc = OWNER.with_borrow(|o| {
                 o.as_ref()
+                    .and_then(|o| o.upgrade())
                     .and_then(|current| current.shared_context.clone())
             });
             match sc {
@@ -331,6 +469,7 @@ impl Owner {
 
             let sc = OWNER.with_borrow(|o| {
                 o.as_ref()
+                    .and_then(|o| o.upgrade())
                     .and_then(|current| current.shared_context.clone())
             });
             match sc {
@@ -442,17 +581,18 @@ impl Drop for OwnerInner {
 
         let nodes = mem::take(&mut self.nodes);
         if !nodes.is_empty() {
+            let mut nodes_to_drop = Vec::with_capacity(nodes.len());
             #[cfg(not(feature = "sandboxed-arenas"))]
             Arena::with_mut(|arena| {
                 for node in nodes {
-                    _ = arena.remove(node);
+                    nodes_to_drop.extend(arena.remove(node));
                 }
             });
             #[cfg(feature = "sandboxed-arenas")]
             {
                 let mut arena = self.arena.write().or_poisoned();
                 for node in nodes {
-                    _ = arena.remove(node);
+                    nodes_to_drop.extend(arena.remove(node));
                 }
             }
         }
@@ -483,10 +623,11 @@ impl Cleanup for RwLock<OwnerInner> {
         }
 
         if !nodes.is_empty() {
+            let mut nodes_to_drop = Vec::with_capacity(nodes.len());
             #[cfg(not(feature = "sandboxed-arenas"))]
             Arena::with_mut(|arena| {
                 for node in nodes {
-                    _ = arena.remove(node);
+                    nodes_to_drop.extend(arena.remove(node));
                 }
             });
             #[cfg(feature = "sandboxed-arenas")]
@@ -494,9 +635,128 @@ impl Cleanup for RwLock<OwnerInner> {
                 let arena = self.read().or_poisoned().arena.clone();
                 let mut arena = arena.write().or_poisoned();
                 for node in nodes {
-                    _ = arena.remove(node);
+                    nodes_to_drop.extend(arena.remove(node));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        owner::{Owner, StoredValue, on_cleanup},
+        signal::signal,
+        traits::{Dispose, GetValue, Set},
+    };
+    use std::{sync::mpsc, thread, time::Duration};
+
+    // A long-lived owner under which many values are allocated and immediately
+    // disposed must not accumulate dead `NodeId`s: `register` prunes disposed
+    // ids when the `nodes` Vec would otherwise grow.
+    #[test]
+    fn dispose_does_not_leak_node_ids_into_owner() {
+        let owner = Owner::new();
+        owner.set();
+
+        for _ in 0..10_000 {
+            let value = StoredValue::new(0u32);
+            value.dispose();
+        }
+
+        let len = owner.inner.read().or_poisoned().nodes.len();
+        assert!(
+            len <= 64,
+            "owner accumulated {len} dead NodeIds after dispose-heavy loop"
+        );
+    }
+
+    // A long-lived parent under which many short-lived children are created and
+    // dropped must not accumulate dead `Weak` refs: `child` prunes them when
+    // the `children` Vec would otherwise grow.
+    #[test]
+    fn dropped_children_do_not_leak_weak_refs() {
+        let parent = Owner::new();
+
+        for _ in 0..10_000 {
+            let child = parent.child();
+            drop(child);
+        }
+
+        let len = parent.inner.read().or_poisoned().children.len();
+        assert!(len <= 64, "parent accumulated {len} dead child Weak refs");
+    }
+
+    fn does_not_deadlock(f: impl FnOnce() + Send + 'static) -> bool {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f();
+            _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
+
+    fn dispose_through_arena(
+        root: &Owner,
+        setup: impl FnOnce(),
+        dispose: impl FnOnce(Owner),
+    ) {
+        let (inner, outer) = root.with(|| (Owner::new(), Owner::new()));
+
+        inner.with(setup);
+        outer.with(|| {
+            _ = StoredValue::new(inner);
+        });
+
+        dispose(outer);
+    }
+
+    #[test]
+    fn dropping_owner_held_in_arena_removes_its_nodes() {
+        assert!(does_not_deadlock(|| {
+            let root = Owner::new();
+            dispose_through_arena(
+                &root,
+                || {
+                    _ = signal(0);
+                },
+                drop,
+            );
+        }));
+    }
+
+    #[test]
+    fn dropping_owner_held_in_arena_runs_cleanups_accessing_arena() {
+        assert!(does_not_deadlock(|| {
+            let root = Owner::new();
+            let value = root.with(|| StoredValue::new(0));
+
+            dispose_through_arena(
+                &root,
+                move || {
+                    let (_, set_count) = signal(0);
+                    on_cleanup(move || {
+                        _ = value.get_value();
+                        set_count.set(1);
+                    });
+                },
+                drop,
+            );
+        }));
+    }
+
+    #[test]
+    fn cleaning_up_owner_holding_owner_in_arena() {
+        assert!(does_not_deadlock(|| {
+            let root = Owner::new();
+            dispose_through_arena(
+                &root,
+                || {
+                    _ = signal(0);
+                },
+                |outer| outer.cleanup(),
+            );
+        }));
     }
 }

@@ -79,7 +79,51 @@ where
     }
 }
 
-#[cfg(not(feature = "nightly"))]
+macro_rules! property_reactive {
+    ($name:ident, <$($gen:ident),*>, $v:ty, $( $where_clause:tt )*) =>
+    {
+        #[allow(deprecated)]
+        impl<$($gen),*> IntoProperty for $name<$($gen),*>
+        where
+            $v: IntoProperty + Clone + Send + Sync + 'static,
+            <$v as IntoProperty>::State: 'static,
+            $($where_clause)*
+        {
+            type State = RenderEffect<<$v as IntoProperty>::State>;
+            type Cloneable = Self;
+            type CloneableOwned = Self;
+
+            fn hydrate<const FROM_SERVER: bool>(
+                self,
+                el: &crate::renderer::types::Element,
+                key: &str,
+            ) -> Self::State {
+                (move || self.get()).hydrate::<FROM_SERVER>(el, key)
+            }
+
+            fn build(
+                self,
+                el: &crate::renderer::types::Element,
+                key: &str,
+            ) -> Self::State {
+                (move || self.get()).build(el, key)
+            }
+
+            fn rebuild(self, state: &mut Self::State, key: &str) {
+                (move || self.get()).rebuild(state, key)
+            }
+
+            fn into_cloneable(self) -> Self::Cloneable {
+                self
+            }
+
+            fn into_cloneable_owned(self) -> Self::CloneableOwned {
+                self
+            }
+        }
+    };
+}
+
 mod stable {
     use crate::html::property::IntoProperty;
     #[allow(deprecated)]
@@ -92,51 +136,6 @@ mod stable {
         traits::Get,
         wrappers::read::{ArcSignal, Signal},
     };
-
-    macro_rules! property_reactive {
-        ($name:ident, <$($gen:ident),*>, $v:ty, $( $where_clause:tt )*) =>
-        {
-            #[allow(deprecated)]
-            impl<$($gen),*> IntoProperty for $name<$($gen),*>
-            where
-                $v: IntoProperty + Clone + Send + Sync + 'static,
-                <$v as IntoProperty>::State: 'static,
-                $($where_clause)*
-            {
-                type State = RenderEffect<<$v as IntoProperty>::State>;
-                type Cloneable = Self;
-                type CloneableOwned = Self;
-
-                fn hydrate<const FROM_SERVER: bool>(
-                    self,
-                    el: &crate::renderer::types::Element,
-                    key: &str,
-                ) -> Self::State {
-                    (move || self.get()).hydrate::<FROM_SERVER>(el, key)
-                }
-
-                fn build(
-                    self,
-                    el: &crate::renderer::types::Element,
-                    key: &str,
-                ) -> Self::State {
-                    (move || self.get()).build(el, key)
-                }
-
-                fn rebuild(self, state: &mut Self::State, key: &str) {
-                    (move || self.get()).rebuild(state, key)
-                }
-
-                fn into_cloneable(self) -> Self::Cloneable {
-                    self
-                }
-
-                fn into_cloneable_owned(self) -> Self::CloneableOwned {
-                    self
-                }
-            }
-        };
-    }
 
     property_reactive!(
         RwSignal,
@@ -182,17 +181,19 @@ mod stable {
     property_reactive!(ArcReadSignal, <V>, V, ArcReadSignal<V>: Get<Value = V>);
     property_reactive!(ArcMemo, <V>, V, ArcMemo<V>: Get<Value = V>);
     property_reactive!(ArcSignal, <V>, V, ArcSignal<V>: Get<Value = V>);
+}
 
-    #[cfg(feature = "reactive_stores")]
-    use {
-        reactive_stores::{
-            ArcField, ArcStore, AtIndex, AtKeyed, DerefedField, Field,
-            KeyedSubfield, Store, StoreField, Subfield,
-        },
-        std::ops::{Deref, DerefMut, Index, IndexMut},
+#[cfg(feature = "reactive_stores")]
+mod reactive_stores {
+    use crate::html::property::IntoProperty;
+    #[allow(deprecated)]
+    use reactive_graph::{effect::RenderEffect, owner::Storage, traits::Get};
+    use reactive_stores::{
+        ArcField, ArcStore, AtIndex, AtKeyed, DerefedField, Field,
+        KeyedSubfield, Store, StoreField, Subfield,
     };
+    use std::ops::{Deref, DerefMut, Index, IndexMut};
 
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         Subfield,
         <Inner, Prev, V>,
@@ -202,7 +203,6 @@ mod stable {
         Inner: Send + Sync + Clone + 'static,
     );
 
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         AtKeyed,
         <Inner, Prev, K, V>,
@@ -211,10 +211,9 @@ mod stable {
         Prev: Send + Sync + 'static,
         Inner: Send + Sync + Clone + 'static,
         K: Send + Sync + std::fmt::Debug + Clone + 'static,
-        for<'a> &'a V: IntoIterator,
+        V: reactive_stores::KeyedIterable,
     );
 
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         KeyedSubfield,
         <Inner, Prev, K, V>,
@@ -223,10 +222,9 @@ mod stable {
         Prev: Send + Sync + 'static,
         Inner: Send + Sync + Clone + 'static,
         K: Send + Sync + std::fmt::Debug + Clone + 'static,
-        for<'a> &'a V: IntoIterator,
+        V: reactive_stores::KeyedIterable,
     );
 
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         DerefedField,
         <S>,
@@ -235,7 +233,6 @@ mod stable {
         <S as StoreField>::Value: Deref + DerefMut
     );
 
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         AtIndex,
         <Inner, Prev>,
@@ -244,7 +241,6 @@ mod stable {
         Prev: Send + Sync + IndexMut<usize> + 'static,
         Inner: Send + Sync + Clone + 'static,
     );
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         Store,
         <V, S>,
@@ -253,7 +249,6 @@ mod stable {
         S: Storage<V> + Storage<Option<V>>,
         S: Send + Sync + 'static,
     );
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(
         Field,
         <V, S>,
@@ -262,8 +257,6 @@ mod stable {
         S: Storage<V> + Storage<Option<V>>,
         S: Send + Sync + 'static,
     );
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(ArcStore, <V>, V, ArcStore<V>: Get<Value = V>);
-    #[cfg(feature = "reactive_stores")]
     property_reactive!(ArcField, <V>, V, ArcField<V>: Get<Value = V>);
 }

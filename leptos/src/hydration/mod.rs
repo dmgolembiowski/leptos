@@ -1,8 +1,12 @@
 #![allow(clippy::needless_lifetimes)]
 
-use crate::prelude::*;
+use crate::{WasmSplitManifest, prelude::*};
 use leptos_config::LeptosOptions;
 use leptos_macro::{component, view};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 /// Inserts auto-reloading code used in `cargo-leptos`.
 ///
@@ -15,19 +19,35 @@ pub fn AutoReload(
     /// Configuration options for this project.
     options: LeptosOptions,
 ) -> impl IntoView {
-    (!disable_watch && std::env::var("LEPTOS_WATCH").is_ok()).then(|| {
-        #[cfg(feature = "nonce")]
+    // `LEPTOS_WATCH` is fixed for the life of the process, but `AutoReload`
+    // renders once per page, so reading the env var each time takes the global
+    // environment lock (and allocates the value `String` when set) on every
+    // response. Resolve it once and cache the boolean.
+    static LEPTOS_WATCH: OnceLock<bool> = OnceLock::new();
+    let watch =
+        *LEPTOS_WATCH.get_or_init(|| std::env::var("LEPTOS_WATCH").is_ok());
+
+    (!disable_watch && watch).then(|| {
         let nonce = crate::nonce::use_nonce();
-        #[cfg(not(feature = "nonce"))]
-        let nonce = None::<()>;
 
         let reload_port = match options.reload_external_port {
             Some(val) => val,
             None => options.reload_port,
         };
+
         let protocol = match options.reload_ws_protocol {
+            leptos_config::ReloadWSProtocol::Auto => "null",
             leptos_config::ReloadWSProtocol::WS => "'ws://'",
             leptos_config::ReloadWSProtocol::WSS => "'wss://'",
+
+            unrecognized => {
+                leptos::logging::error!(
+                    "Unrecognized live reload protocol option '{}'",
+                    unrecognized,
+                );
+
+                "null"
+            }
         };
 
         let script = format!(
@@ -57,42 +77,134 @@ pub fn HydrationScripts(
     /// A base url, not including a trailing slash
     #[prop(optional, into)]
     root: Option<String>,
+    /// Should be `true` to load and run the hydration scripts during browser idle
+    /// time, keeping the JS and WASM off the critical rendering path.
+    ///
+    /// This delays interactivity by a few hundred milliseconds, so forms and links
+    /// that rely on hydration should be avoided before the page is idle. Forms with
+    /// a plain `method`/`action` continue to work. Has no effect in `islands` mode,
+    /// which already hydrates on idle.
+    #[prop(optional)]
+    defer: bool,
 ) -> impl IntoView {
-    let mut js_file_name = options.output_name.to_string();
-    let mut wasm_file_name = options.output_name.to_string();
-    if options.hash_files {
-        let hash_path = std::env::current_exe()
-            .map(|path| {
-                path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
-            })
-            .unwrap_or_default()
-            .join(options.hash_file.as_ref());
-        if hash_path.exists() {
+    static SPLIT_MANIFEST: OnceLock<Option<WasmSplitManifest>> =
+        OnceLock::new();
+
+    if let Some(splits) = SPLIT_MANIFEST.get_or_init(|| {
+        let root = root.clone().unwrap_or_default();
+
+        let (wasm_split_js, wasm_split_manifest) = if options.hash_files {
+            let hash_path = std::env::current_exe()
+                .map(|path| {
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+                })
+                .unwrap_or_default()
+                .join(options.hash_file.as_ref());
             let hashes = std::fs::read_to_string(&hash_path)
                 .expect("failed to read hash file");
+
+            let mut split =
+                "__wasm_split.______________________.js".to_string();
+            let mut manifest = "__wasm_split_manifest.json".to_string();
             for line in hashes.lines() {
                 let line = line.trim();
-                if !line.is_empty() {
-                    if let Some((file, hash)) = line.split_once(':') {
-                        if file == "js" {
-                            js_file_name.push_str(&format!(".{}", hash.trim()));
-                        } else if file == "wasm" {
-                            wasm_file_name
-                                .push_str(&format!(".{}", hash.trim()));
-                        }
+                if !line.is_empty()
+                    && let Some((file, hash)) = line.split_once(':')
+                {
+                    if file == "manifest" {
+                        manifest.clear();
+                        manifest.push_str("__wasm_split_manifest.");
+                        manifest.push_str(hash.trim());
+                        manifest.push_str(".json");
+                    }
+                    if file == "split" {
+                        split.clear();
+                        split.push_str("__wasm_split.");
+                        split.push_str(hash.trim());
+                        split.push_str(".js");
                     }
                 }
             }
-        }
-    } else if std::option_env!("LEPTOS_OUTPUT_NAME").is_none() {
-        wasm_file_name.push_str("_bg");
+            (split, manifest)
+        } else {
+            (
+                "__wasm_split.______________________.js".to_string(),
+                "__wasm_split_manifest.json".to_string(),
+            )
+        };
+
+        let site_dir = &options.site_root;
+        let pkg_dir = &options.site_pkg_dir;
+        let path = PathBuf::from(site_dir.to_string());
+        let path = path.join(pkg_dir.to_string()).join(wasm_split_manifest);
+        let file = std::fs::read_to_string(path).ok()?;
+
+        let manifest = WasmSplitManifest(ArcStoredValue::new((
+            format!(
+                "{}/{}",
+                root.trim_end_matches('/'),
+                options.pkg_url_path()
+            ),
+            serde_json::from_str(&file).expect("could not read manifest file"),
+            wasm_split_js,
+        )));
+
+        Some(manifest)
+    }) {
+        provide_context(splits.clone());
     }
 
-    let pkg_path = &options.site_pkg_dir;
-    #[cfg(feature = "nonce")]
+    // The hashed asset file names are process-static: the running binary maps to
+    // exactly one set of `output.js` / `output.wasm` names for its whole lifetime.
+    // Resolve them once and memoize, mirroring the `SPLIT_MANIFEST` `OnceLock` above,
+    // so we don't re-run `current_exe()` + `stat` + `open`/`read` of the hash file
+    // (plus the surrounding allocations) on every SSR response.
+    static HASHED_NAMES: OnceLock<(Arc<str>, Arc<str>)> = OnceLock::new();
+
+    let (js_file_name, wasm_file_name) = HASHED_NAMES
+        .get_or_init(|| {
+            let mut js_file_name = options.output_name.to_string();
+            let mut wasm_file_name = options.output_name.to_string();
+            if options.hash_files {
+                let hash_path = std::env::current_exe()
+                    .map(|path| {
+                        path.parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default()
+                    .join(options.hash_file.as_ref());
+                if hash_path.exists() {
+                    let hashes = std::fs::read_to_string(&hash_path)
+                        .expect("failed to read hash file");
+                    for line in hashes.lines() {
+                        let line = line.trim();
+                        if !line.is_empty()
+                            && let Some((file, hash)) = line.split_once(':')
+                        {
+                            if file == "js" {
+                                js_file_name.push('.');
+                                js_file_name.push_str(hash.trim());
+                            } else if file == "wasm" {
+                                wasm_file_name.push('.');
+                                wasm_file_name.push_str(hash.trim());
+                            }
+                        }
+                    }
+                } else {
+                    leptos::logging::error!(
+                        "File hashing is active but no hash file was found"
+                    );
+                }
+            } else if std::option_env!("LEPTOS_OUTPUT_NAME").is_none() {
+                wasm_file_name.push_str("_bg");
+            }
+            (js_file_name.into(), wasm_file_name.into())
+        })
+        .clone();
+
+    let pkg_path = options.pkg_url_path();
     let nonce = crate::nonce::use_nonce();
-    #[cfg(not(feature = "nonce"))]
-    let nonce = None::<String>;
     let script = if islands {
         if let Some(sc) = Owner::current_shared_context() {
             sc.set_is_hydrating(false);
@@ -107,21 +219,36 @@ pub fn HydrationScripts(
         .unwrap_or_default();
 
     let root = root.unwrap_or_default();
-    use_context::<IslandsRouterNavigation>().is_none().then(|| {
-        view! {
-            <link rel="modulepreload" href=format!("{root}/{pkg_path}/{js_file_name}.js") nonce=nonce.clone()/>
-            <link
-                rel="preload"
-                href=format!("{root}/{pkg_path}/{wasm_file_name}.wasm")
-                r#as="fetch"
-                r#type="application/wasm"
-                crossorigin=nonce.clone().unwrap_or_default()
-            />
-            <script type="module" nonce=nonce>
-                {format!("{script}({root:?}, {pkg_path:?}, {js_file_name:?}, {wasm_file_name:?});{islands_router}")}
-            </script>
-        }
-    })
+    // Trim a trailing slash so the base URL joins cleanly with `pkg_path`.
+    let root = root.trim_end_matches('/');
+    // `islands` already hydrates on idle, so `defer` would be a no-op there
+    let defer = defer && !islands;
+    // the resource hints are still useful to warm the cache before the idle
+    // callback fires, but at `low` priority so they don't compete with the
+    // render-blocking resources that determine LCP
+    let priority = defer.then_some("low");
+    view! {
+        <link
+            rel="modulepreload"
+            href=format!("{root}/{pkg_path}/{js_file_name}.js")
+            crossorigin=nonce.clone()
+            fetchpriority=priority
+        />
+        <link
+            rel="preload"
+            href=format!("{root}/{pkg_path}/{wasm_file_name}.wasm")
+            r#as="fetch"
+            r#type="application/wasm"
+            crossorigin=nonce
+                .as_ref()
+                .map(|n| Oco::Counted(n.as_inner().clone()))
+                .unwrap_or(Oco::Borrowed(""))
+            fetchpriority=priority
+        />
+        <script type="module" nonce=nonce>
+            {format!("{script}({root:?}, {pkg_path:?}, {js_file_name:?}, {wasm_file_name:?}, {defer});{islands_router}")}
+        </script>
+    }
 }
 
 /// If this is provided via context, it means that you are using the islands router and

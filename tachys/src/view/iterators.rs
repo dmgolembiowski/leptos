@@ -1,9 +1,9 @@
 use super::{
-    add_attr::AddAnyAttr, Mountable, Position, PositionState, Render,
-    RenderHtml,
+    Mountable, Position, PositionState, Render, RenderFlags, RenderHtml,
+    add_attr::AddAnyAttr,
 };
 use crate::{
-    html::attribute::{any_attribute::AnyAttribute, Attribute},
+    html::attribute::{Attribute, any_attribute::AnyAttribute},
     hydration::Cursor,
     renderer::Rndr,
     ssr::StreamBuilder,
@@ -88,29 +88,21 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         match self {
             Some(value) => Either::Left(value),
             None => Either::Right(()),
         }
-        .to_html_with_buf(
-            buf,
-            position,
-            escape,
-            mark_branches,
-            extra_attrs,
-        )
+        .to_html_with_buf(buf, position, flags, extra_attrs)
     }
 
     fn to_html_async_with_buf<const OUT_OF_ORDER: bool>(
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -122,8 +114,7 @@ where
         .to_html_async_with_buf::<OUT_OF_ORDER>(
             buf,
             position,
-            escape,
-            mark_branches,
+            flags,
             extra_attrs,
         )
     }
@@ -139,6 +130,19 @@ where
             None => Either::Right(()),
         }
         .hydrate::<FROM_SERVER>(cursor, position)
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        match self {
+            Some(value) => Either::Left(value),
+            None => Either::Right(()),
+        }
+        .hydrate_async(cursor, position)
+        .await
     }
 
     fn into_owned(self) -> Self::Owned {
@@ -167,7 +171,7 @@ where
         if old.is_empty() {
             let mut new = self.build().states;
             for item in new.iter_mut() {
-                Rndr::mount_before(item, marker.as_ref());
+                Rndr::try_mount_before(item, marker.as_ref());
             }
             *old = new;
         } else if self.is_empty() {
@@ -186,7 +190,7 @@ where
                     }
                     itertools::EitherOrBoth::Left(new) => {
                         let mut new_state = new.build();
-                        Rndr::mount_before(&mut new_state, marker.as_ref());
+                        Rndr::try_mount_before(&mut new_state, marker.as_ref());
                         adds.push(new_state);
                     }
                     itertools::EitherOrBoth::Right(old) => {
@@ -237,11 +241,12 @@ where
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
-        if let Some(first) = self.states.first() {
-            first.insert_before_this(child)
-        } else {
-            self.marker.insert_before_this(child)
+        for state in &self.states {
+            if state.insert_before_this(child) {
+                return true;
+            }
         }
+        self.marker.insert_before_this(child)
     }
 
     fn elements(&self) -> Vec<crate::renderer::types::Element> {
@@ -303,31 +308,23 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         let mut children = self.into_iter();
         if let Some(first) = children.next() {
-            first.to_html_with_buf(
-                buf,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs.clone(),
-            );
+            first.to_html_with_buf(buf, position, flags, extra_attrs.clone());
         }
         for child in children {
             child.to_html_with_buf(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 // each child will have the extra attributes applied
                 extra_attrs.clone(),
             );
         }
-        if escape {
+        if flags.hydrate {
             buf.push_str("<!>");
             *position = Position::NextChild;
         }
@@ -337,8 +334,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -348,8 +344,7 @@ where
             first.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs.clone(),
             );
         }
@@ -357,12 +352,11 @@ where
             child.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs.clone(),
             );
         }
-        if escape {
+        if flags.hydrate {
             buf.push_sync("<!>");
             *position = Position::NextChild;
         }
@@ -377,6 +371,22 @@ where
             .into_iter()
             .map(|child| child.hydrate::<FROM_SERVER>(cursor, position))
             .collect();
+
+        let marker = cursor.next_placeholder(position);
+        position.set(Position::NextChild);
+
+        VecState { states, marker }
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let mut states = Vec::with_capacity(self.len());
+        for child in self {
+            states.push(child.hydrate_async(cursor, position).await);
+        }
 
         let marker = cursor.next_placeholder(position);
         position.set(Position::NextChild);
@@ -434,7 +444,7 @@ where
     T: Mountable,
 {
     states: Vec<T>,
-    parent: Option<crate::renderer::types::Element>,
+    marker: crate::renderer::types::Placeholder,
 }
 
 impl<T> Mountable for StaticVecState<T>
@@ -442,7 +452,10 @@ where
     T: Mountable,
 {
     fn unmount(&mut self) {
-        self.states.iter_mut().for_each(Mountable::unmount);
+        for state in self.states.iter_mut() {
+            state.unmount();
+        }
+        self.marker.unmount();
     }
 
     fn mount(
@@ -453,15 +466,16 @@ where
         for state in self.states.iter_mut() {
             state.mount(parent, marker);
         }
-        self.parent = Some(parent.clone());
+        self.marker.mount(parent, marker);
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
-        if let Some(first) = self.states.first() {
-            first.insert_before_this(child)
-        } else {
-            false
+        for state in &self.states {
+            if state.insert_before_this(child) {
+                return true;
+            }
         }
+        self.marker.insert_before_this(child)
     }
 
     fn elements(&self) -> Vec<crate::renderer::types::Element> {
@@ -479,27 +493,52 @@ where
     type State = StaticVecState<T::State>;
 
     fn build(self) -> Self::State {
+        let marker = Rndr::create_placeholder();
         Self::State {
             states: self.0.into_iter().map(T::build).collect(),
-            parent: None,
+            marker,
         }
     }
 
     fn rebuild(self, state: &mut Self::State) {
-        let Self::State { states, .. } = state;
+        let StaticVecState { states, marker } = state;
+        let old = states;
 
-        // StaticVec's in general shouldn't need to be reused, but rebuild() will still trigger e.g. if 2 routes have the same tree,
-        // this can cause problems if differing in lengths. Because we don't use marker nodes in StaticVec, we rebuild the entire vec remounting to the parent.
-
-        for state in states {
-            state.unmount();
+        // reuses the Vec impl
+        if old.is_empty() {
+            let mut new = self.build().states;
+            for item in new.iter_mut() {
+                Rndr::mount_before(item, marker.as_ref());
+            }
+            *old = new;
+        } else if self.0.is_empty() {
+            // TODO fast path for clearing
+            for item in old.iter_mut() {
+                item.unmount();
+            }
+            old.clear();
+        } else {
+            let mut adds = vec![];
+            let mut removes_at_end = 0;
+            for item in self.0.into_iter().zip_longest(old.iter_mut()) {
+                match item {
+                    itertools::EitherOrBoth::Both(new, old) => {
+                        T::rebuild(new, old)
+                    }
+                    itertools::EitherOrBoth::Left(new) => {
+                        let mut new_state = new.build();
+                        Rndr::mount_before(&mut new_state, marker.as_ref());
+                        adds.push(new_state);
+                    }
+                    itertools::EitherOrBoth::Right(old) => {
+                        removes_at_end += 1;
+                        old.unmount()
+                    }
+                }
+            }
+            old.truncate(old.len() - removes_at_end);
+            old.append(&mut adds);
         }
-        let parent = state
-            .parent
-            .take()
-            .expect("parent should always be Some() on a StaticVec rebuild()");
-        *state = self.build();
-        state.mount(&parent, None);
     }
 }
 
@@ -550,25 +589,22 @@ where
     }
 
     fn html_len(&self) -> usize {
-        self.0.iter().map(RenderHtml::html_len).sum::<usize>()
+        self.0.iter().map(RenderHtml::html_len).sum::<usize>() + 3
     }
 
     fn to_html_with_buf(
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         for child in self.0.into_iter() {
-            child.to_html_with_buf(
-                buf,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs.clone(),
-            );
+            child.to_html_with_buf(buf, position, flags, extra_attrs.clone());
+        }
+        if flags.hydrate {
+            buf.push_str("<!>");
+            *position = Position::NextChild;
         }
     }
 
@@ -576,8 +612,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -586,10 +621,13 @@ where
             child.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs.clone(),
             );
+        }
+        if flags.hydrate {
+            buf.push_sync("<!>");
+            *position = Position::NextChild;
         }
     }
 
@@ -603,8 +641,27 @@ where
             .into_iter()
             .map(|child| child.hydrate::<FROM_SERVER>(cursor, position))
             .collect();
-        let parent = cursor.current().parent_element();
-        Self::State { states, parent }
+
+        let marker = cursor.next_placeholder(position);
+        position.set(Position::NextChild);
+
+        Self::State { states, marker }
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let mut states = Vec::with_capacity(self.0.len());
+        for child in self.0 {
+            states.push(child.hydrate_async(cursor, position).await);
+        }
+
+        let marker = cursor.next_placeholder(position);
+        position.set(Position::NextChild);
+
+        Self::State { states, marker }
     }
 
     fn into_owned(self) -> Self::Owned {
@@ -665,11 +722,12 @@ where
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
-        if let Some(first) = self.states.first() {
-            first.insert_before_this(child)
-        } else {
-            false
+        for state in &self.states {
+            if state.insert_before_this(child) {
+                return true;
+            }
         }
+        false
     }
 
     fn elements(&self) -> Vec<crate::renderer::types::Element> {
@@ -730,18 +788,11 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         for child in self.into_iter() {
-            child.to_html_with_buf(
-                buf,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs.clone(),
-            );
+            child.to_html_with_buf(buf, position, flags, extra_attrs.clone());
         }
     }
 
@@ -749,8 +800,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -759,8 +809,7 @@ where
             child.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs.clone(),
             );
         }
@@ -773,6 +822,21 @@ where
     ) -> Self::State {
         let states =
             self.map(|child| child.hydrate::<FROM_SERVER>(cursor, position));
+        ArrayState { states }
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let mut states = Vec::with_capacity(self.len());
+        for child in self {
+            states.push(child.hydrate_async(cursor, position).await);
+        }
+        let Ok(states) = <[<T as Render>::State; N]>::try_from(states) else {
+            unreachable!()
+        };
         ArrayState { states }
     }
 

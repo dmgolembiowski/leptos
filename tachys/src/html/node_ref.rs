@@ -1,13 +1,16 @@
 use super::{
     attribute::{
-        maybe_next_attr_erasure_macros::next_attr_output_type, Attribute,
-        NextAttribute,
+        Attribute, NextAttribute,
+        maybe_next_attr_erasure_macros::next_attr_output_type,
     },
     element::ElementType,
 };
 use crate::{
     html::{
-        attribute::maybe_next_attr_erasure_macros::next_attr_combine,
+        attribute::{
+            NamedAttributeKey,
+            maybe_next_attr_erasure_macros::next_attr_combine,
+        },
         element::HtmlElement,
     },
     prelude::Render,
@@ -59,7 +62,6 @@ impl<E, C> Attribute for NodeRefAttr<E, C>
 where
     E: ElementType,
     C: NodeRefContainer<E>,
-
     crate::renderer::types::Element: PartialEq,
 {
     const MIN_LENGTH: usize = 0;
@@ -112,13 +114,16 @@ where
     async fn resolve(self) -> Self::AsyncOutput {
         self
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![]
+    }
 }
 
 impl<E, C> NextAttribute for NodeRefAttr<E, C>
 where
     E: ElementType,
     C: NodeRefContainer<E>,
-
     crate::renderer::types::Element: PartialEq,
 {
     next_attr_output_type!(Self, NewAttr);
@@ -136,7 +141,6 @@ pub trait NodeRefAttribute<E, C>
 where
     E: ElementType,
     C: NodeRefContainer<E>,
-
     crate::renderer::types::Element: PartialEq,
 {
     /// Binds this HTML element to a [`NodeRefContainer`].
@@ -158,7 +162,6 @@ where
     At: Attribute,
     Ch: Render,
     C: NodeRefContainer<E>,
-
     crate::renderer::types::Element: PartialEq,
 {
 }

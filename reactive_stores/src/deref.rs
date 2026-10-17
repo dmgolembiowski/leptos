@@ -1,7 +1,7 @@
 use crate::{
+    KeyMap, StoreFieldTrigger,
     path::{StorePath, StorePathSegment},
     store_field::StoreField,
-    KeyMap, StoreFieldTrigger,
 };
 use reactive_graph::{
     signal::guards::{Mapped, MappedMut},
@@ -39,7 +39,7 @@ where
     #[track_caller]
     fn deref_field(self) -> DerefedField<Self> {
         DerefedField {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
             inner: self,
         }
@@ -51,7 +51,7 @@ where
 #[derive(Debug, Copy, Clone)]
 pub struct DerefedField<S> {
     inner: S,
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
 }
 
@@ -68,9 +68,19 @@ where
     fn get_trigger(&self, path: StorePath) -> StoreFieldTrigger {
         self.inner.get_trigger(path)
     }
+
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner.get_trigger_unkeyed(path)
+    }
+
     fn path(&self) -> impl IntoIterator<Item = StorePathSegment> {
         self.inner.path()
     }
+
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        self.inner.path_unkeyed()
+    }
+
     fn reader(&self) -> Option<Self::Reader> {
         let inner = self.inner.reader()?;
         Some(Mapped::new_with_guard(inner, |n| n.deref()))
@@ -92,11 +102,11 @@ where
     <S::Value as Deref>::Target: Sized + 'static,
 {
     fn defined_at(&self) -> Option<&'static Location<'static>> {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, leptos_debuginfo))]
         {
             Some(self.defined_at)
         }
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(any(debug_assertions, leptos_debuginfo)))]
         {
             None
         }

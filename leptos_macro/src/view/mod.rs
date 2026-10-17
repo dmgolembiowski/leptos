@@ -1,19 +1,21 @@
 mod component_builder;
 mod slot_helper;
+#[cfg(test)]
+mod tests;
 mod utils;
 
 use self::{
     component_builder::component_to_tokens,
     slot_helper::{get_slot, slot_to_tokens},
 };
+use crate::diagnostics::Errors;
 use convert_case::{
     Case::{Snake, UpperCamel},
     Casing,
 };
 use leptos_hot_reload::parsing::{is_component_node, value_to_string};
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
-use proc_macro_error2::abort;
-use quote::{format_ident, quote, quote_spanned, ToTokens};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use rstml::node::{
     CustomNode, KVAttributeValue, KeyedAttribute, Node, NodeAttribute,
     NodeBlock, NodeElement, NodeName, NodeNameFragment,
@@ -23,11 +25,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
 };
 use syn::{
+    Expr::{self, Tuple},
+    ExprArray, ExprLit, ExprPath, ExprRange, Lit, LitStr, RangeLimits, Stmt,
     punctuated::Pair::{End, Punctuated},
     spanned::Spanned,
-    Expr,
-    Expr::Tuple,
-    ExprArray, ExprLit, ExprRange, Lit, LitStr, RangeLimits, Stmt,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,12 +39,92 @@ pub(crate) enum TagType {
     Math,
 }
 
+/// Parse `view!`/`template!` input into nodes, plus a token stream carrying any
+/// parse-error diagnostics (ready to splice into the macro output).
+///
+/// In debug builds this adds a recovery pass for rust-analyzer. While you are
+/// still typing an opening tag — e.g. `view! { <A/> <Counter ` — the half-typed
+/// tag has no closing `/>`, so rstml discards that element and no props are
+/// offered for completion. We retry with a synthetic `/>` appended and keep the
+/// retry only if it *strictly reduces* the number of parse errors without
+/// losing any nodes. Together with rust-analyzer's own cursor fix-up, that lets
+/// a half-typed component still expand into its props builder so the editor can
+/// complete its props.
+///
+/// A complete view parses with **zero** errors, so the retry is never even
+/// attempted for valid code — this can only ever affect incomplete, mid-edit
+/// input.
+pub fn parse_nodes(tokens: TokenStream) -> (Vec<Node>, TokenStream) {
+    let new_parser = || {
+        rstml::Parser::new(rstml::ParserConfig::default().recover_block(true))
+    };
+
+    #[cfg(debug_assertions)]
+    let retry_tokens = (!tokens.is_empty()).then(|| tokens.clone());
+
+    #[allow(unused_mut)] // mutated only by the debug-only recovery below
+    let (mut nodes, mut errors) =
+        new_parser().parse_recoverable(tokens).split_vec();
+
+    // Only incomplete input has parse errors; a valid view has none and is
+    // left completely untouched.
+    #[cfg(debug_assertions)]
+    if !errors.is_empty()
+        && let Some(retry_tokens) = retry_tokens
+    {
+        let mut patched = retry_tokens;
+        patched.extend([
+            TokenTree::Punct(proc_macro2::Punct::new(
+                '/',
+                proc_macro2::Spacing::Joint,
+            )),
+            TokenTree::Punct(proc_macro2::Punct::new(
+                '>',
+                proc_macro2::Spacing::Alone,
+            )),
+        ]);
+        let (recovered_nodes, recovered_errors) =
+            new_parser().parse_recoverable(patched).split_vec();
+        // Accept the recovery only if it genuinely improved the parse:
+        // strictly fewer errors and no nodes lost.
+        if recovered_errors.len() < errors.len()
+            && recovered_nodes.len() >= nodes.len()
+        {
+            nodes = recovered_nodes;
+            errors = recovered_errors;
+        }
+    }
+
+    let errors = errors.into_iter().map(|e| e.emit_as_expr_tokens());
+    (nodes, quote! { #(#errors;)* })
+}
+
 pub fn render_view(
     nodes: &mut [Node],
     global_class: Option<&TokenTree>,
     view_marker: Option<String>,
     disable_inert_html: bool,
-) -> Option<TokenStream> {
+) -> syn::Result<Option<TokenStream>> {
+    let mut errors = Errors::default();
+    let result = render_view_inner(
+        nodes,
+        global_class,
+        view_marker,
+        disable_inert_html,
+        &mut errors,
+    );
+    errors.finish(result)
+}
+
+fn render_view_inner(
+    nodes: &mut [Node],
+    global_class: Option<&TokenTree>,
+    view_marker: Option<String>,
+    disable_inert_html: bool,
+    errors: &mut Errors,
+) -> syn::Result<Option<TokenStream>> {
+    let disable_inert_html = disable_inert_html || global_class.is_some();
+
     let (base, should_add_view) = match nodes.len() {
         0 => {
             let span = Span::call_site();
@@ -63,7 +144,8 @@ pub fn render_view(
                 view_marker.as_deref(),
                 true,
                 disable_inert_html,
-            ),
+                errors,
+            )?,
             // only add View wrapper and view marker to a regular HTML
             // element or component, not to a <{..} /> attribute list
             match &nodes[0] {
@@ -79,11 +161,12 @@ pub fn render_view(
                 global_class,
                 view_marker.as_deref(),
                 disable_inert_html,
-            ),
+                errors,
+            )?,
             true,
         ),
     };
-    base.map(|view| {
+    Ok(base.map(|view| {
         if !should_add_view {
             view
         } else if let Some(vm) = view_marker {
@@ -100,7 +183,7 @@ pub fn render_view(
                 )
             }
         }
-    })
+    }))
 }
 
 fn is_inert_element(orig_node: &Node<impl CustomNode>) -> bool {
@@ -112,9 +195,9 @@ fn is_inert_element(orig_node: &Node<impl CustomNode>) -> bool {
                 return false;
             }
 
-            // also doesn't work if the top-level element is an SVG/MathML element
+            // also doesn't work if the top-level element is a MathML element
             let el_name = el.name().to_string();
-            if is_svg_element(&el_name) || is_math_ml_element(&el_name) {
+            if is_math_ml_element(&el_name) {
                 return false;
             }
         }
@@ -155,7 +238,7 @@ fn is_inert_element(orig_node: &Node<impl CustomNode>) -> bool {
                                             matches!(&value.value, KVAttributeValue::Expr(expr) if {
                                                 if let Expr::Lit(lit) = expr {
                                                     let key = attr.key.to_string();
-                                                    if key.starts_with("style:") || key.starts_with("prop:") || key.starts_with("on:") || key.starts_with("use:") || key.starts_with("bind") {
+                                                    if key.starts_with("style:") || key.starts_with("prop:") || key.starts_with("on:") || key.starts_with("use:") || key.starts_with("bind:") {
                                                         false
                                                     } else {
                                                         matches!(&lit.lit, Lit::Str(_))
@@ -300,7 +383,7 @@ fn inert_element_to_tokens(
     node: &Node<impl CustomNode>,
     escape_text: bool,
     global_class: Option<&TokenTree>,
-) -> Option<TokenStream> {
+) -> TokenStream {
     let mut html = InertElementBuilder::new(global_class);
     let mut nodes = VecDeque::from([Item::Node(node, escape_text)]);
 
@@ -335,9 +418,7 @@ fn inert_element_to_tokens(
                     Node::Element(node) => {
                         let self_closing = is_self_closing(node);
                         let el_name = node.name().to_string();
-                        let escape = el_name != "script"
-                            && el_name != "style"
-                            && el_name != "textarea";
+                        let escape = el_name != "script" && el_name != "style";
 
                         // opening tag
                         html.push('<');
@@ -356,22 +437,19 @@ fn inert_element_to_tokens(
 
                                 if let Some(value) =
                                     attr.possible_value.to_value()
-                                {
-                                    if let KVAttributeValue::Expr(Expr::Lit(
+                                    && let KVAttributeValue::Expr(Expr::Lit(
                                         lit,
                                     )) = &value.value
-                                    {
-                                        if let Lit::Str(txt) = &lit.lit {
-                                            let value = txt.value();
-                                            let value = html_escape::encode_double_quoted_attribute(&value);
-                                            if attr_name == "class" {
-                                                html.push_class(&value);
-                                            } else {
-                                                html.push_str("=\"");
-                                                html.push_str(&value);
-                                                html.push('"');
-                                            }
-                                        }
+                                    && let Lit::Str(txt) = &lit.lit
+                                {
+                                    let value = txt.value();
+                                    let value = html_escape::encode_double_quoted_attribute(&value);
+                                    if attr_name == "class" {
+                                        html.push_class(&value);
+                                    } else {
+                                        html.push_str("=\"");
+                                        html.push_str(&value);
+                                        html.push('"');
                                     }
                                 };
                             }
@@ -396,9 +474,118 @@ fn inert_element_to_tokens(
 
     html.finish();
 
-    Some(quote! {
+    quote! {
         ::leptos::tachys::html::InertElement::new(#html)
-    })
+    }
+}
+
+/// # Note
+/// Should not be used on top level `<svg>` elements.
+/// Use [`inert_element_to_tokens`] instead.
+fn inert_svg_element_to_tokens(
+    node: &Node<impl CustomNode>,
+    escape_text: bool,
+    global_class: Option<&TokenTree>,
+) -> TokenStream {
+    let mut html = InertElementBuilder::new(global_class);
+    let mut nodes = VecDeque::from([Item::Node(node, escape_text)]);
+
+    while let Some(current) = nodes.pop_front() {
+        match current {
+            Item::ClosingTag(tag) => {
+                // closing tag
+                html.push_str("</");
+                html.push_str(&tag);
+                html.push('>');
+            }
+            Item::Node(current, escape) => {
+                match current {
+                    Node::RawText(raw) => {
+                        let text = raw.to_string_best();
+                        let text = if escape {
+                            html_escape::encode_text(&text)
+                        } else {
+                            text.into()
+                        };
+                        html.push_str(&text);
+                    }
+                    Node::Text(text) => {
+                        let text = text.value_string();
+                        let text = if escape {
+                            html_escape::encode_text(&text)
+                        } else {
+                            text.into()
+                        };
+                        html.push_str(&text);
+                    }
+                    Node::Element(node) => {
+                        let self_closing = is_self_closing(node);
+                        let el_name = node.name().to_string();
+                        // strip trailing underscores, for identifiers such as SVG use_
+                        let el_name = el_name
+                            .strip_suffix('_')
+                            .map(str::to_string)
+                            .unwrap_or(el_name);
+
+                        let escape = el_name != "script" && el_name != "style";
+
+                        // opening tag
+                        html.push('<');
+                        html.push_str(&el_name);
+
+                        for attr in node.attributes() {
+                            if let NodeAttribute::Attribute(attr) = attr {
+                                let attr_name = attr.key.to_string();
+                                // trim r# from raw identifiers like r#as
+                                let attr_name =
+                                    attr_name.trim_start_matches("r#");
+                                if attr_name != "class" {
+                                    html.push(' ');
+                                    html.push_str(attr_name);
+                                }
+
+                                if let Some(value) =
+                                    attr.possible_value.to_value()
+                                    && let KVAttributeValue::Expr(Expr::Lit(
+                                        lit,
+                                    )) = &value.value
+                                    && let Lit::Str(txt) = &lit.lit
+                                {
+                                    let value = txt.value();
+                                    let value = html_escape::encode_double_quoted_attribute(&value);
+                                    if attr_name == "class" {
+                                        html.push_class(&value);
+                                    } else {
+                                        html.push_str("=\"");
+                                        html.push_str(&value);
+                                        html.push('"');
+                                    }
+                                };
+                            }
+                        }
+
+                        html.push('>');
+
+                        // render all children
+                        if !self_closing {
+                            nodes.push_front(Item::ClosingTag(el_name));
+                            let children = node.children.iter().rev();
+                            for child in children {
+                                nodes.push_front(Item::Node(child, escape));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    html.finish();
+
+    quote! {
+        ::leptos::tachys::svg::InertElement::new(#html)
+    }
 }
 
 fn element_children_to_tokens(
@@ -408,7 +595,8 @@ fn element_children_to_tokens(
     global_class: Option<&TokenTree>,
     view_marker: Option<&str>,
     disable_inert_html: bool,
-) -> Option<TokenStream> {
+    errors: &mut Errors,
+) -> syn::Result<Option<TokenStream>> {
     let children = children_to_tokens(
         nodes,
         parent_type,
@@ -417,8 +605,9 @@ fn element_children_to_tokens(
         view_marker,
         false,
         disable_inert_html,
-    );
-    if children.is_empty() {
+        errors,
+    )?;
+    Ok(if children.is_empty() {
         None
     } else if children.len() == 1 {
         let child = &children[0];
@@ -431,7 +620,9 @@ fn element_children_to_tokens(
     } else if cfg!(feature = "__internal_erase_components") {
         Some(quote! {
             .child(
-                leptos::tachys::view::iterators::StaticVec::from(vec![#(#children.into_maybe_erased()),*])
+                ::leptos::tachys::view::iterators::StaticVec::from(vec![#(
+                    ::leptos::prelude::IntoMaybeErased::into_maybe_erased(#children)
+                ),*])
             )
         })
     } else if children.len() > 16 {
@@ -455,7 +646,7 @@ fn element_children_to_tokens(
                 (#(#children),*)
             )
         })
-    }
+    })
 }
 
 fn fragment_to_tokens(
@@ -465,7 +656,8 @@ fn fragment_to_tokens(
     global_class: Option<&TokenTree>,
     view_marker: Option<&str>,
     disable_inert_html: bool,
-) -> Option<TokenStream> {
+    errors: &mut Errors,
+) -> syn::Result<Option<TokenStream>> {
     let children = children_to_tokens(
         nodes,
         parent_type,
@@ -474,14 +666,17 @@ fn fragment_to_tokens(
         view_marker,
         true,
         disable_inert_html,
-    );
-    if children.is_empty() {
+        errors,
+    )?;
+    Ok(if children.is_empty() {
         None
     } else if children.len() == 1 {
         children.into_iter().next()
     } else if cfg!(feature = "__internal_erase_components") {
         Some(quote! {
-            leptos::tachys::view::iterators::StaticVec::from(vec![#(#children.into_maybe_erased()),*])
+            ::leptos::tachys::view::iterators::StaticVec::from(vec![#(
+                ::leptos::prelude::IntoMaybeErased::into_maybe_erased(#children)
+            ),*])
         })
     } else if children.len() > 16 {
         // implementations of various traits used in routing and rendering are implemented for
@@ -500,9 +695,10 @@ fn fragment_to_tokens(
         Some(quote! {
             (#(#children),*)
         })
-    }
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn children_to_tokens(
     nodes: &mut [Node<impl CustomNode>],
     parent_type: TagType,
@@ -511,7 +707,8 @@ fn children_to_tokens(
     view_marker: Option<&str>,
     top_level: bool,
     disable_inert_html: bool,
-) -> Vec<TokenStream> {
+    errors: &mut Errors,
+) -> syn::Result<Vec<TokenStream>> {
     if nodes.len() == 1 {
         match node_to_tokens(
             &mut nodes[0],
@@ -521,9 +718,10 @@ fn children_to_tokens(
             view_marker,
             top_level,
             disable_inert_html,
-        ) {
-            Some(tokens) => vec![tokens],
-            None => vec![],
+            errors,
+        )? {
+            Some(tokens) => Ok(vec![tokens]),
+            None => Ok(vec![]),
         }
     } else {
         let mut slots = HashMap::new();
@@ -538,9 +736,11 @@ fn children_to_tokens(
                     view_marker,
                     top_level,
                     disable_inert_html,
+                    errors,
                 )
+                .transpose()
             })
-            .collect();
+            .collect::<syn::Result<Vec<_>>>()?;
         if let Some(parent_slots) = parent_slots {
             for (slot, mut values) in slots.drain() {
                 parent_slots
@@ -549,10 +749,11 @@ fn children_to_tokens(
                     .or_insert(values);
             }
         }
-        nodes
+        Ok(nodes)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn node_to_tokens(
     node: &mut Node<impl CustomNode>,
     parent_type: TagType,
@@ -561,14 +762,15 @@ fn node_to_tokens(
     view_marker: Option<&str>,
     top_level: bool,
     disable_inert_html: bool,
-) -> Option<TokenStream> {
+    errors: &mut Errors,
+) -> syn::Result<Option<TokenStream>> {
     let is_inert = !disable_inert_html && is_inert_element(node);
 
     match node {
-        Node::Comment(_) => None,
+        Node::Comment(_) => Ok(None),
         Node::Doctype(node) => {
             let value = node.value.to_string_best();
-            Some(quote! { ::leptos::tachys::html::doctype(#value) })
+            Ok(Some(quote! { ::leptos::tachys::html::doctype(#value) }))
         }
         Node::Fragment(fragment) => fragment_to_tokens(
             &mut fragment.children,
@@ -577,23 +779,66 @@ fn node_to_tokens(
             global_class,
             view_marker,
             disable_inert_html,
+            errors,
         ),
         Node::Block(block) => {
-            Some(quote! { ::leptos::prelude::IntoRender::into_render(#block) })
+            // When `--cfg erase_components` is set on the downstream crate (which
+            // activates `__internal_erase_components` here via the workaround in
+            // leptos/Cargo.toml), wrap reactive child closures in the
+            // non-generic `__as_shared_reactive_fn` helper. Collapses every
+            // `{move || …}` site into one `Render`/`Effect` monomorphization
+            // per output type instead of one per closure type. Trade-off: one
+            // `Arc<Mutex<_>>` allocation per closure + a vtable dispatch per
+            // render.
+            //
+            // Only applies when the block body is syntactically a closure
+            // expression (`{move || …}` or `{|| …}`). Plain expressions like
+            // `{format!(…)}` or `{my_string}` are left untouched — they
+            // aren't `FnMut() -> T`.
+            let is_closure_block = if let NodeBlock::ValidBlock(b) = block {
+                b.stmts.len() == 1
+                    && matches!(&b.stmts[0], Stmt::Expr(Expr::Closure(_), _),)
+            } else {
+                false
+            };
+            if cfg!(feature = "__internal_erase_components") && is_closure_block
+            {
+                Ok(Some(quote! {
+                    ::leptos::prelude::IntoRender::into_render(
+                        ::leptos::__as_shared_reactive_fn(#block)
+                    )
+                }))
+            } else {
+                Ok(Some(
+                    quote! { ::leptos::prelude::IntoRender::into_render(#block) },
+                ))
+            }
         }
-        Node::Text(text) => Some(text_to_tokens(&text.value)),
+        Node::Text(text) => Ok(Some(text_to_tokens(&text.value))),
         Node::RawText(raw) => {
             let text = raw.to_string_best();
             let text = syn::LitStr::new(&text, raw.span());
-            Some(text_to_tokens(&text))
+            Ok(Some(text_to_tokens(&text)))
         }
         Node::Element(el_node) => {
             if !top_level && is_inert {
                 let el_name = el_node.name().to_string();
-                let escape = el_name != "script"
-                    && el_name != "style"
-                    && el_name != "textarea";
-                inert_element_to_tokens(node, escape, global_class)
+                let escape = el_name != "script" && el_name != "style";
+
+                let el_name = el_node.name().to_string();
+                if is_svg_element(&el_name) && el_name != "svg" {
+                    Ok(Some(inert_svg_element_to_tokens(
+                        node,
+                        escape,
+                        global_class,
+                    )))
+                } else {
+                    Ok(Some(inert_element_to_tokens(
+                        node,
+                        escape,
+                        global_class,
+                    )))
+                }
             } else {
                 element_to_tokens(
                     el_node,
@@ -602,16 +847,17 @@ fn node_to_tokens(
                     global_class,
                     view_marker,
                     disable_inert_html,
+                    errors,
                 )
             }
         }
-        Node::Custom(node) => Some(node.to_token_stream()),
+        Node::Custom(node) => Ok(Some(node.to_token_stream())),
     }
 }
 
 fn text_to_tokens(text: &LitStr) -> TokenStream {
     // on nightly, can use static string optimization
-    if cfg!(feature = "nightly") {
+    if cfg!(all(feature = "nightly", rustc_nightly)) {
         quote! {
             ::leptos::tachys::view::static_types::Static::<#text>
         }
@@ -629,7 +875,8 @@ pub(crate) fn element_to_tokens(
     global_class: Option<&TokenTree>,
     view_marker: Option<&str>,
     disable_inert_html: bool,
-) -> Option<TokenStream> {
+    errors: &mut Errors,
+) -> syn::Result<Option<TokenStream>> {
     // attribute sorting:
     //
     // the `class` and `style` attributes overwrite individual `class:` and `style:` attributes
@@ -668,15 +915,15 @@ pub(crate) fn element_to_tokens(
             _ => None,
         };
 
-        if let NodeAttribute::Attribute(a) = a {
-            if let Some(Tuple(_)) = a.value() {
-                return Ordering::Greater;
-            }
+        if let NodeAttribute::Attribute(a) = a
+            && let Some(Tuple(_)) = a.value()
+        {
+            return Ordering::Greater;
         }
-        if let NodeAttribute::Attribute(b) = b {
-            if let Some(Tuple(_)) = b.value() {
-                return Ordering::Less;
-            }
+        if let NodeAttribute::Attribute(b) = b
+            && let Some(Tuple(_)) = b.value()
+        {
+            return Ordering::Less;
         }
 
         match (key_a.as_deref(), key_b.as_deref()) {
@@ -691,10 +938,17 @@ pub(crate) fn element_to_tokens(
 
     // check for duplicate attribute names and emit an error for all subsequent ones
     let mut names = HashSet::new();
+
+    // allow multiple class=(...) or style=(...) attributes
+    fn allow_multiples(name: &str, attr: &KeyedAttribute) -> bool {
+        (name == "class" || name == "style")
+            && matches!(attr.value(), Some(Expr::Tuple(..)))
+    }
+
     for attr in node.attributes() {
         if let NodeAttribute::Attribute(attr) = attr {
             let mut name = attr.key.to_string();
-            match tuple_name(&name, attr) {
+            match tuple_name(&name, attr)? {
                 TupleName::None => {}
                 TupleName::Str(tuple_name) => {
                     name.push(':');
@@ -707,11 +961,11 @@ pub(crate) fn element_to_tokens(
                     }
                 }
             }
-            if names.contains(&name) {
-                proc_macro_error2::emit_error!(
-                    attr.span(),
-                    format!("This element already has a `{name}` attribute.")
-                );
+            if names.contains(&name) && !allow_multiples(&name, attr) {
+                errors.push(syn::Error::new_spanned(
+                    attr,
+                    format!("This element already has a `{name}` attribute."),
+                ));
             } else {
                 names.insert(name);
             }
@@ -728,10 +982,12 @@ pub(crate) fn element_to_tokens(
                 parent_slots,
                 global_class,
                 disable_inert_html,
-            );
-            None
+                errors,
+            )?;
+            Ok(None)
         } else {
-            Some(component_to_tokens(node, global_class, disable_inert_html))
+            component_to_tokens(node, global_class, disable_inert_html, errors)
+                .map(Some)
         }
     } else if is_spread_marker(node) {
         let mut attributes = Vec::new();
@@ -761,7 +1017,7 @@ pub(crate) fn element_to_tokens(
                     }
                 }
                 NodeAttribute::Attribute(node) => {
-                    if let Some(content) = attribute_absolute(node, true) {
+                    if let Some(content) = attribute_absolute(node, true)? {
                         attributes.push(content);
                     }
                 }
@@ -769,15 +1025,15 @@ pub(crate) fn element_to_tokens(
         }
 
         if cfg!(feature = "__internal_erase_components") {
-            Some(quote! {
+            Ok(Some(quote! {
                 vec![#(#attributes.into_any_attr(),)*]
                 #(.add_any_attr(#additions))*
-            })
+            }))
         } else {
-            Some(quote! {
+            Ok(Some(quote! {
                 (#(#attributes,)*)
                 #(.add_any_attr(#additions))*
-            })
+            }))
         }
     } else {
         let tag = name.to_string();
@@ -805,9 +1061,7 @@ pub(crate) fn element_to_tokens(
         } else if is_ambiguous_element(&tag) {
             match parent_type {
                 TagType::Unknown => {
-                    // We decided this warning was too aggressive, but I'll leave it here in case we want it later
-                    /* proc_macro_error2::emit_warning!(name.span(), "The view macro is assuming this is an HTML element, \
-                    but it is ambiguous; if it is an SVG or MathML element, prefix with svg:: or math::"); */
+                    // We decided this warning was too aggressive.
                     quote_spanned! { node.name().span() =>
                         ::leptos::tachys::html::element::#name()
                     }
@@ -839,11 +1093,21 @@ pub(crate) fn element_to_tokens(
                 &attributes[0],
                 global_class,
                 is_custom,
-            ))
+                errors,
+            )?)
         } else {
-            let nodes = attributes.iter().map(|node| {
-                attribute_to_tokens(parent_type, node, global_class, is_custom)
-            });
+            let nodes = attributes
+                .iter()
+                .map(|node| {
+                    attribute_to_tokens(
+                        parent_type,
+                        node,
+                        global_class,
+                        is_custom,
+                        errors,
+                    )
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
             Some(quote! {
                 #(#nodes)*
             })
@@ -862,29 +1126,30 @@ pub(crate) fn element_to_tokens(
                 global_class,
                 view_marker,
                 disable_inert_html,
-            )
+                errors,
+            )?
         } else {
             if !node.children.is_empty() {
                 let name = node.name();
-                proc_macro_error2::emit_error!(
-                    name.span(),
+                errors.push(syn::Error::new_spanned(
+                    name,
                     format!(
                         "Self-closing elements like <{name}> cannot have \
                          children."
-                    )
-                );
+                    ),
+                ));
             };
             None
         };
 
         // attributes are placed second because this allows `inner_html`
         // to object if there are already children
-        Some(quote! {
+        Ok(Some(quote! {
             #name
             #children
             #attributes
             #global_class_expr
-        })
+        }))
     }
 }
 
@@ -930,8 +1195,9 @@ fn attribute_to_tokens(
     node: &NodeAttribute,
     global_class: Option<&TokenTree>,
     is_custom: bool,
-) -> TokenStream {
-    match node {
+    errors: &mut Errors,
+) -> syn::Result<TokenStream> {
+    Ok(match node {
         NodeAttribute::Block(node) => as_spread_attr(node)
             .flatten()
             .map(|end| {
@@ -958,7 +1224,7 @@ fn attribute_to_tokens(
             } else if let Some(name) = name.strip_prefix("use:") {
                 directive_call_from_attribute_node(node, name)
             } else if let Some(name) = name.strip_prefix("on:") {
-                event_to_tokens(name, node)
+                event_to_tokens(name, node)?
             } else if let Some(name) = name.strip_prefix("bind:") {
                 two_way_binding_to_tokens(name, node)
             } else if let Some(name) = name.strip_prefix("class:") {
@@ -966,13 +1232,13 @@ fn attribute_to_tokens(
                     NodeName::Punctuated(parts) => &parts[0],
                     _ => unreachable!(),
                 };
-                class_to_tokens(node, class.into_token_stream(), Some(name))
+                class_to_tokens(node, class.into_token_stream(), Some(name))?
             } else if name == "class" {
                 let class = match &node.key {
                     NodeName::Path(path) => path.path.get_ident(),
                     _ => unreachable!(),
                 };
-                class_to_tokens(node, class.into_token_stream(), None)
+                class_to_tokens(node, class.into_token_stream(), None)?
             } else if let Some(name) = name.strip_prefix("style:") {
                 let style = match &node.key {
                     NodeName::Punctuated(parts) => &parts[0],
@@ -1015,10 +1281,10 @@ fn attribute_to_tokens(
                     && node.value().and_then(value_to_string).is_none()
                 {
                     let span = node.key.span();
-                    proc_macro_error2::emit_error!(span, "Combining a global class (view! { class = ... }) \
+                    errors.push(syn::Error::new(span, "Combining a global class (view! { class = ... }) \
             and a dynamic `class=` attribute on an element causes runtime inconsistencies. You can \
             toggle individual classes dynamically with the `class:name=value` syntax. \n\nSee this issue \
-            for more information and an example: https://github.com/leptos-rs/leptos/issues/773")
+            for more information and an example: https://github.com/leptos-rs/leptos/issues/773"));
                 };
 
                 quote! {
@@ -1026,14 +1292,14 @@ fn attribute_to_tokens(
                 }
             }
         }
-    }
+    })
 }
 
 /// Returns attribute values with an absolute path
 pub(crate) fn attribute_absolute(
     node: &KeyedAttribute,
     after_spread: bool,
-) -> Option<TokenStream> {
+) -> syn::Result<Option<TokenStream>> {
     let key = node.key.to_string();
     let contains_dash = key.contains('-');
     let attr_colon = key.starts_with("attr:")
@@ -1042,7 +1308,7 @@ pub(crate) fn attribute_absolute(
         || key.starts_with("prop:")
         || key.starts_with("use:");
     // anything that follows the x:y pattern
-    match &node.key {
+    Ok(match &node.key {
         NodeName::Punctuated(parts) if !contains_dash || attr_colon => {
             if parts.len() >= 2 {
                 let id = &parts[0];
@@ -1118,18 +1384,18 @@ pub(crate) fn attribute_absolute(
                             let key = &node.key.to_string();
                             let key = key.replacen("on:", "", 1);
                             let (on, ty, handler) =
-                                event_type_and_handler(&key, node);
+                                event_type_and_handler(&key, node)?;
                             Some(
                                 quote! { ::leptos::tachys::html::event::#on(#ty, #handler) },
                             )
                         } else {
-                            proc_macro_error2::abort!(
+                            return Err(syn::Error::new(
                                 id.span(),
-                                &format!(
+                                format!(
                                     "`{id}:` syntax is not supported on \
                                      components"
-                                )
-                            );
+                                ),
+                            ));
                         }
                     }
                     _ => None,
@@ -1163,7 +1429,7 @@ pub(crate) fn attribute_absolute(
                 }
             }
         }),
-    }
+    })
 }
 
 pub(crate) fn two_way_binding_to_tokens(
@@ -1189,21 +1455,22 @@ pub(crate) fn two_way_binding_to_tokens(
 pub(crate) fn event_to_tokens(
     name: &str,
     node: &KeyedAttribute,
-) -> TokenStream {
-    let (on, event_type, handler) = event_type_and_handler(name, node);
+) -> syn::Result<TokenStream> {
+    let (on, event_type, handler) = event_type_and_handler(name, node)?;
 
-    quote! {
+    Ok(quote! {
         .#on(#event_type, #handler)
-    }
+    })
 }
 
 pub(crate) fn event_type_and_handler(
     name: &str,
     node: &KeyedAttribute,
-) -> (TokenStream, TokenStream, TokenStream) {
+) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
     let handler = attribute_value(node, false);
 
-    let (event_type, is_custom, options) = parse_event_name(name);
+    let (event_type, is_custom, options) =
+        parse_event_name(name, node.key.span())?;
 
     let event_name_ident = match &node.key {
         NodeName::Punctuated(parts) => {
@@ -1269,49 +1536,46 @@ pub(crate) fn event_type_and_handler(
         event_type
     };
 
-    (on, event_type, handler)
+    Ok((on, event_type, handler))
 }
 
 fn class_to_tokens(
     node: &KeyedAttribute,
     class: TokenStream,
     class_name: Option<&str>,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     // case of class=(["foo", "bar"], /* something */)
     // just expands to multiple uses of class:
-    if let Some(Tuple(tuple)) = node.value() {
-        if tuple.elems.len() == 2 {
-            let name = &tuple.elems[0];
-            let value = &tuple.elems[1];
-            if let Expr::Array(ExprArray { elems, .. }) = name {
-                return elems
-                    .iter()
-                    .map(|elem| match elem {
-                        Expr::Lit(ExprLit {
-                            lit: Lit::Str(s), ..
-                        }) => quote! {
-                            .#class((#s, #value))
-                        },
-                        _ => proc_macro_error2::abort!(
-                            elem.span(),
-                            "invalid name"
-                        ),
-                    })
-                    .collect();
-            }
+    if let Some(Tuple(tuple)) = node.value()
+        && tuple.elems.len() == 2
+    {
+        let name = &tuple.elems[0];
+        let value = &tuple.elems[1];
+        if let Expr::Array(ExprArray { elems, .. }) = name {
+            return elems
+                .iter()
+                .map(|elem| match elem {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) => Ok(quote! {
+                        .#class((#s, #value))
+                    }),
+                    _ => Err(syn::Error::new_spanned(elem, "invalid name")),
+                })
+                .collect();
         }
     }
 
     // default case
     let value = attribute_value(node, false);
     if let Some(class_name) = class_name {
-        quote! {
+        Ok(quote! {
             .#class((#class_name, #value))
-        }
+        })
     } else {
-        quote! {
+        Ok(quote! {
             .#class(#value)
-        }
+        })
     }
 }
 
@@ -1472,22 +1736,54 @@ fn is_ambiguous_element(tag: &str) -> bool {
     tag == "a" || tag == "script" || tag == "title"
 }
 
-fn parse_event(event_name: &str) -> (String, EventNameOptions) {
-    let undelegated = event_name.contains(":undelegated");
-    let targeted = event_name.contains(":target");
-    let captured = event_name.contains(":capture");
-    let event_name = event_name
-        .replace(":undelegated", "")
-        .replace(":target", "")
-        .replace(":capture", "");
-    (
-        event_name,
+fn parse_event(
+    event_name: &str,
+    span: Span,
+) -> syn::Result<(String, EventNameOptions)> {
+    try_parse_event(event_name).map_err(|modifier| {
+        syn::Error::new(
+            span,
+            format!(
+                "unknown event modifier `:{modifier}`; expected one of \
+                 `:undelegated`, `:target`, or `:capture`"
+            ),
+        )
+    })
+}
+
+/// Splits an event name into its base name and modifier flags.
+///
+/// The base event name is everything before the first `:`; each remaining
+/// `:`-separated fragment must be one of the three known modifiers. Returns
+/// `Err(fragment)` for any unrecognized modifier so the caller can report it,
+/// rather than matching modifiers as substrings (which silently accepted
+/// typos like `:targeted` and mangled the event name).
+fn try_parse_event(
+    event_name: &str,
+) -> Result<(String, EventNameOptions), String> {
+    let mut fragments = event_name.split(':');
+    let name = fragments.next().unwrap_or_default().to_string();
+
+    let mut undelegated = false;
+    let mut targeted = false;
+    let mut captured = false;
+    for modifier in fragments {
+        match modifier {
+            "undelegated" => undelegated = true,
+            "target" => targeted = true,
+            "capture" => captured = true,
+            other => return Err(other.to_string()),
+        }
+    }
+
+    Ok((
+        name,
         EventNameOptions {
             undelegated,
             targeted,
             captured,
         },
-    )
+    ))
 }
 
 /// Escapes Rust keywords that are also HTML attribute names
@@ -1511,19 +1807,40 @@ fn attribute_value(
         None => quote! { true },
         Some(value) => match &value.value {
             KVAttributeValue::Expr(expr) => {
-                if let Expr::Lit(lit) = expr {
-                    if cfg!(feature = "nightly") {
-                        if let Lit::Str(str) = &lit.lit {
-                            return quote! {
-                                ::leptos::tachys::view::static_types::Static::<#str>
-                            };
-                        }
-                    }
+                if let Expr::Lit(lit) = expr
+                    && cfg!(all(feature = "nightly", rustc_nightly))
+                    && let Lit::Str(str) = &lit.lit
+                {
+                    return quote! {
+                        ::leptos::tachys::view::static_types::Static::<#str>
+                    };
                 }
 
+                // When `--cfg erase_components` is active and the attribute value
+                // is a syntactic zero-argument closure (`move || …` / `|| …`),
+                // wrap it in `__as_shared_reactive_fn` so downstream
+                // `IntoAttributeValue` / `IntoClass` / `IntoStyle` / `IntoProperty`
+                // impls monomorphize per output type instead of per closure type.
+                // Event handlers (`move |ev| …`) have one input so they are skipped.
+                let wrap_closure = cfg!(
+                    feature = "__internal_erase_components"
+                ) && matches!(expr, Expr::Closure(c) if c.inputs.is_empty());
+
                 if matches!(expr, Expr::Lit(_)) || !is_attribute_proper {
+                    if wrap_closure {
+                        quote! {
+                            ::leptos::__as_shared_reactive_fn(#expr)
+                        }
+                    } else {
+                        quote! {
+                            #expr
+                        }
+                    }
+                } else if wrap_closure {
                     quote! {
-                        #expr
+                        ::leptos::prelude::IntoAttributeValue::into_attribute_value(
+                            ::leptos::__as_shared_reactive_fn(#expr)
+                        )
                     }
                 } else {
                     quote! {
@@ -1548,7 +1865,7 @@ fn attribute_value(
 }
 
 // Keep list alphabetized for binary search
-const TYPED_EVENTS: [&str; 126] = [
+const TYPED_EVENTS: [&str; 127] = [
     "DOMContentLoaded",
     "abort",
     "afterprint",
@@ -1644,6 +1961,7 @@ const TYPED_EVENTS: [&str; 126] = [
     "reset",
     "resize",
     "scroll",
+    "scrollend",
     "securitypolicyviolation",
     "seeked",
     "seeking",
@@ -1679,7 +1997,7 @@ const TYPED_EVENTS: [&str; 126] = [
 
 const CUSTOM_EVENT: &str = "Custom";
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct EventNameOptions {
     undelegated: bool,
     targeted: bool,
@@ -1688,35 +2006,39 @@ pub(crate) struct EventNameOptions {
 
 pub(crate) fn parse_event_name(
     name: &str,
-) -> (TokenStream, bool, EventNameOptions) {
-    let (name, options) = parse_event(name);
+    span: Span,
+) -> syn::Result<(TokenStream, bool, EventNameOptions)> {
+    let (name, options) = parse_event(name, span)?;
 
     let (event_type, is_custom) = TYPED_EVENTS
         .binary_search(&name.as_str())
         .map(|_| (name.as_str(), false))
         .unwrap_or((CUSTOM_EVENT, true));
 
-    let Ok(event_type) = event_type.parse::<TokenStream>() else {
-        abort!(event_type, "couldn't parse event name");
-    };
+    let event_type = event_type.parse::<TokenStream>().map_err(|_| {
+        syn::Error::new_spanned(event_type, "couldn't parse event name")
+    })?;
 
     let event_type = if is_custom {
         quote! { Custom::new(#name) }
     } else {
         event_type
     };
-    (event_type, is_custom, options)
+    Ok((event_type, is_custom, options))
 }
 
 fn convert_to_snake_case(name: String) -> String {
-    if !name.is_case(Snake) {
+    if name.to_case(Snake) != name {
         name.to_case(Snake)
     } else {
         name
     }
 }
 
-pub(crate) fn ident_from_tag_name(tag_name: &NodeName) -> Ident {
+pub(crate) fn ident_from_tag_name(
+    tag_name: &NodeName,
+    errors: &mut Errors,
+) -> Ident {
     match tag_name {
         NodeName::Path(path) => path
             .path
@@ -1727,16 +2049,41 @@ pub(crate) fn ident_from_tag_name(tag_name: &NodeName) -> Ident {
             .expect("element needs to have a name"),
         NodeName::Block(_) => {
             let span = tag_name.span();
-            proc_macro_error2::emit_error!(
+            errors.push(syn::Error::new(
                 span,
-                "blocks not allowed in tag-name position"
-            );
+                "blocks not allowed in tag-name position",
+            ));
             Ident::new("", span)
         }
         _ => Ident::new(
             &tag_name.to_string().replace(['-', ':'], "_"),
             tag_name.span(),
         ),
+    }
+}
+
+pub(crate) fn full_path_from_tag_name(
+    tag_name: &NodeName,
+    errors: &mut Errors,
+) -> Option<ExprPath> {
+    match tag_name {
+        NodeName::Path(path) => Some(path.clone()),
+        NodeName::Block(_) => {
+            let span = tag_name.span();
+            errors.push(syn::Error::new(
+                span,
+                "blocks not allowed in tag-name position",
+            ));
+            None
+        }
+        _ => {
+            let span = tag_name.span();
+            errors.push(syn::Error::new(
+                span,
+                "punctuated names not allowed in slots",
+            ));
+            None
+        }
     }
 }
 
@@ -1755,42 +2102,39 @@ pub(crate) fn directive_call_from_attribute_node(
     quote! { .directive(#handler, #[allow(clippy::useless_conversion)] #param) }
 }
 
-fn tuple_name(name: &str, node: &KeyedAttribute) -> TupleName {
-    if name == "style" || name == "class" {
-        if let Some(Tuple(tuple)) = node.value() {
-            {
-                if tuple.elems.len() == 2 {
-                    let style_name = &tuple.elems[0];
-                    if let Expr::Lit(ExprLit {
-                        lit: Lit::Str(s), ..
-                    }) = style_name
-                    {
-                        return TupleName::Str(s.value());
-                    } else if let Expr::Array(ExprArray { elems, .. }) =
-                        style_name
-                    {
-                        return TupleName::Array(
-                            elems
-                                .iter()
-                                .filter_map(|elem| match elem {
-                                    Expr::Lit(ExprLit {
-                                        lit: Lit::Str(s),
-                                        ..
-                                    }) => Some(s.value()),
-                                    _ => proc_macro_error2::abort!(
-                                        elem.span(),
-                                        "invalid name"
-                                    ),
-                                })
-                                .collect(),
-                        );
-                    }
+fn tuple_name(name: &str, node: &KeyedAttribute) -> syn::Result<TupleName> {
+    if (name == "style" || name == "class")
+        && let Some(Tuple(tuple)) = node.value()
+    {
+        {
+            if tuple.elems.len() == 2 {
+                let style_name = &tuple.elems[0];
+                if let Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = style_name
+                {
+                    return Ok(TupleName::Str(s.value()));
+                } else if let Expr::Array(ExprArray { elems, .. }) = style_name
+                {
+                    return elems
+                        .iter()
+                        .map(|elem| match elem {
+                            Expr::Lit(ExprLit {
+                                lit: Lit::Str(s), ..
+                            }) => Ok(s.value()),
+                            _ => Err(syn::Error::new_spanned(
+                                elem,
+                                "invalid name",
+                            )),
+                        })
+                        .collect::<syn::Result<Vec<_>>>()
+                        .map(TupleName::Array);
                 }
             }
         }
     }
 
-    TupleName::None
+    Ok(TupleName::None)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1798,4 +2142,79 @@ enum TupleName {
     None,
     Str(String),
     Array(Vec<String>),
+}
+
+#[cfg(test)]
+mod inert_element_tests {
+    use super::is_inert_element;
+    use quote::quote;
+
+    fn is_inert(tokens: proc_macro2::TokenStream) -> bool {
+        let config = rstml::ParserConfig::default().recover_block(true);
+        let parser = rstml::Parser::new(config);
+        let (nodes, _) = parser.parse_recoverable(tokens).split_vec();
+        is_inert_element(&nodes[0])
+    }
+
+    #[test]
+    fn plain_string_attribute_is_inert() {
+        // `binding` merely starts with the letters "bind"; it is a normal
+        // string-literal attribute, not the `bind:` two-way directive, so an
+        // element carrying only such attributes must take the inert fast path.
+        assert!(is_inert(quote! { <custom-element binding="foo" /> }));
+        assert!(is_inert(quote! { <div bind-target="x" /> }));
+    }
+
+    #[test]
+    fn leptos_directives_are_not_inert() {
+        // The genuine namespaced directives must keep excluding the element
+        // from the inert path, matching `attribute_to_tokens`.
+        assert!(!is_inert(quote! { <input bind:value="x" /> }));
+        assert!(!is_inert(quote! { <div style:color="red" /> }));
+        assert!(!is_inert(quote! { <div prop:foo="bar" /> }));
+    }
+}
+
+#[cfg(test)]
+mod parse_event_tests {
+    use super::try_parse_event;
+
+    fn parse(name: &str) -> (String, (bool, bool, bool)) {
+        let (name, opts) = try_parse_event(name).unwrap();
+        (name, (opts.undelegated, opts.targeted, opts.captured))
+    }
+
+    #[test]
+    fn plain_and_modified_events() {
+        assert_eq!(parse("click"), ("click".into(), (false, false, false)));
+        assert_eq!(
+            parse("click:target"),
+            ("click".into(), (false, true, false))
+        );
+        assert_eq!(
+            parse("click:undelegated"),
+            ("click".into(), (true, false, false))
+        );
+        assert_eq!(
+            parse("click:capture"),
+            ("click".into(), (false, false, true))
+        );
+        assert_eq!(
+            parse("click:undelegated:capture"),
+            ("click".into(), (true, false, true))
+        );
+    }
+
+    #[test]
+    fn unknown_modifier_is_rejected_not_substring_matched() {
+        // `:targeted` is a typo for `:target`; substring matching used to
+        // accept it (and mangle the event name to `clicked`). Exact matching
+        // surfaces it as an error instead.
+        assert_eq!(try_parse_event("click:targeted"), Err("targeted".into()));
+        assert_eq!(
+            try_parse_event("click:capturefoo"),
+            Err("capturefoo".into())
+        );
+        assert_eq!(try_parse_event("click:capture2"), Err("capture2".into()));
+    }
 }

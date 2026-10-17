@@ -1,3 +1,7 @@
+use crate::{
+    diagnostics::{Errors, message_with_help},
+    stable_hash::fnv1a_64,
+};
 use attribute_derive::FromAttr;
 use convert_case::{
     Case::{Pascal, Snake},
@@ -6,19 +10,19 @@ use convert_case::{
 use itertools::Itertools;
 use leptos_hot_reload::parsing::value_to_string;
 use proc_macro2::{Ident, Span, TokenStream};
-use proc_macro_error2::abort;
-use quote::{format_ident, quote, quote_spanned, ToTokens, TokenStreamExt};
-use std::hash::DefaultHasher;
+use quote::{ToTokens, TokenStreamExt, format_ident, quote, quote_spanned};
 use syn::{
-    parse::Parse, parse_quote, spanned::Spanned, token::Colon,
-    visit_mut::VisitMut, AngleBracketedGenericArguments, Attribute, FnArg,
-    GenericArgument, GenericParam, Item, ItemFn, LitStr, Meta, Pat, PatIdent,
-    Path, PathArguments, ReturnType, Signature, Stmt, Type, TypeImplTrait,
-    TypeParam, TypePath, Visibility,
+    AngleBracketedGenericArguments, Attribute, FnArg, GenericArgument,
+    GenericParam, Item, ItemFn, LitStr, Meta, Pat, PatIdent, Path,
+    PathArguments, ReturnType, Signature, Stmt, Type, TypeImplTrait, TypeParam,
+    TypePath, Visibility, parse::Parse, parse_quote, spanned::Spanned,
+    token::Colon, visit_mut::VisitMut,
 };
 
 pub struct Model {
+    validation_error: Option<syn::Error>,
     is_transparent: bool,
+    is_lazy: bool,
     island: Option<String>,
     docs: Docs,
     unknown_attrs: UnknownAttrs,
@@ -32,20 +36,34 @@ pub struct Model {
 impl Parse for Model {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut item = ItemFn::parse(input)?;
-        maybe_modify_return_type(&mut item.sig.output);
+        maybe_modify_return_type(&mut item.sig);
 
         convert_impl_trait_to_generic(&mut item.sig);
 
-        let docs = Docs::new(&item.attrs);
+        let (docs, mut validation_error) = match Docs::new(&item.attrs) {
+            Ok(docs) => (docs, None),
+            Err(error) => (Docs(Vec::new()), Some(error)),
+        };
         let unknown_attrs = UnknownAttrs::new(&item.attrs);
 
-        let props = item
-            .sig
-            .inputs
-            .clone()
-            .into_iter()
-            .map(Prop::new)
-            .collect::<Vec<_>>();
+        let props = if validation_error.is_none() {
+            match item
+                .sig
+                .inputs
+                .clone()
+                .into_iter()
+                .map(Prop::new)
+                .collect::<syn::Result<Vec<_>>>()
+            {
+                Ok(props) => props,
+                Err(error) => {
+                    validation_error = Some(error);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         // We need to remove the `#[doc = ""]` and `#[builder(_)]`
         // attrs from the function signature
@@ -65,7 +83,9 @@ impl Parse for Model {
         });
 
         Ok(Self {
+            validation_error,
             is_transparent: false,
+            is_lazy: false,
             island: None,
             docs,
             unknown_attrs,
@@ -80,34 +100,39 @@ impl Parse for Model {
 
 /// Exists to fix nested routes defined in a separate component in erased mode,
 /// by replacing the return type with AnyNestedRoute, which is what it'll be, but is required as the return type for compiler inference.
-fn maybe_modify_return_type(ret: &mut ReturnType) {
+fn maybe_modify_return_type(sig: &mut Signature) {
     #[cfg(feature = "__internal_erase_components")]
     {
-        if let ReturnType::Type(_, ty) = ret {
-            if let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref() {
-                // If one of the bounds is MatchNestedRoutes, we need to replace the return type with AnyNestedRoute:
-                if bounds.iter().any(|bound| {
-                    if let syn::TypeParamBound::Trait(trait_bound) = bound {
-                        if trait_bound.path.segments.iter().any(
-                            |path_segment| {
-                                path_segment.ident == "MatchNestedRoutes"
-                            },
-                        ) {
-                            return true;
-                        }
-                    }
-                    false
-                }) {
-                    *ty = parse_quote!(
-                        ::leptos_router::any_nested_route::AnyNestedRoute
-                    );
+        if let ReturnType::Type(_, ty) = &mut sig.output
+            && let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref()
+        {
+            // If one of the bounds is MatchNestedRoutes, we need to replace the return type with AnyNestedRoute:
+            if bounds.iter().any(|bound| {
+                if let syn::TypeParamBound::Trait(trait_bound) = bound
+                    && trait_bound.path.segments.iter().any(|path_segment| {
+                        path_segment.ident == "MatchNestedRoutes"
+                    })
+                {
+                    return true;
                 }
+                false
+            }) {
+                // precise-capturing `use<..>` bounds only make sense on `impl Trait`
+                let bounds = bounds.iter().filter(|bound| {
+                    !matches!(bound, syn::TypeParamBound::PreciseCapture(_))
+                });
+                sig.generics.make_where_clause().predicates.push(parse_quote!(
+                    ::leptos_router::any_nested_route::AnyNestedRoute: #(#bounds)+*
+                ));
+                *ty = parse_quote!(
+                    ::leptos_router::any_nested_route::AnyNestedRoute
+                );
             }
         }
     }
     #[cfg(not(feature = "__internal_erase_components"))]
     {
-        let _ = ret;
+        let _ = sig;
     }
 }
 
@@ -129,17 +154,26 @@ pub fn drain_filter<T>(
 
 pub fn convert_from_snake_case(name: &Ident) -> Ident {
     let name_str = name.to_string();
-    if !name_str.is_case(Snake) {
+    if name_str.to_case(Snake) != name_str {
         name.clone()
     } else {
         Ident::new(&name_str.to_case(Pascal), name.span())
     }
 }
 
-impl ToTokens for Model {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl Model {
+    pub(crate) fn expand(
+        mut self,
+        errors: &mut Errors,
+    ) -> syn::Result<TokenStream> {
+        if let Some(error) = self.validation_error.take() {
+            return Err(error);
+        }
+
         let Self {
+            validation_error: _,
             is_transparent,
+            is_lazy,
             island,
             docs,
             unknown_attrs,
@@ -148,7 +182,7 @@ impl ToTokens for Model {
             props,
             body,
             ret,
-        } = self;
+        } = &self;
         let is_island = island.is_some();
 
         let no_props = props.is_empty();
@@ -161,14 +195,14 @@ impl ToTokens for Model {
                     _ => None,
                 });
             if let Some(semi) = ends_semi {
-                proc_macro_error2::emit_error!(
+                errors.push(syn::Error::new(
                     semi.span(),
                     "A component that ends with a `view!` macro followed by a \
                      semicolon will return (), an empty view. This is usually \
                      an accident, not intentional, so we prevent it. If you’d \
                      like to return (), you can do it it explicitly by \
-                     returning () as the last item from the component."
-                );
+                     returning () as the last item from the component.",
+                ));
             }
         }
 
@@ -192,7 +226,7 @@ impl ToTokens for Model {
                 || (!is_island_with_children && !props.is_empty()));
 
         let prop_builder_fields =
-            prop_builder_fields(vis, props, is_island_with_other_props);
+            prop_builder_fields(vis, props, is_island_with_other_props)?;
         let props_serializer = if is_island_with_other_props {
             let fields = prop_serializer_fields(vis, props);
             quote! {
@@ -212,7 +246,7 @@ impl ToTokens for Model {
             name.span(),
         );
 
-        let component_fn_prop_docs = generate_component_fn_prop_docs(props);
+        let component_fn_prop_docs = generate_component_fn_prop_docs(props)?;
         let docs_and_prop_docs = if component_fn_prop_docs.is_empty() {
             // Avoid generating an empty doc line in case the component has no doc and no props.
             quote! {
@@ -289,12 +323,9 @@ impl ToTokens for Model {
 
         let component_id = name.to_string();
         let hydrate_fn_name = is_island.then(|| {
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher = DefaultHasher::new();
-            island.hash(&mut hasher);
-            let caller = hasher.finish() as usize;
-            Ident::new(&format!("{component_id}_{caller:?}"), name.span())
+            let caller: u64 =
+                fnv1a_64(island.as_deref().unwrap_or_default().as_bytes());
+            Ident::new(&format!("{component_id}_{caller:016x}"), name.span())
         });
 
         let island_serialize_props = if is_island_with_other_props {
@@ -329,9 +360,12 @@ impl ToTokens for Model {
             }
         };
 
+        // a component with no return type returns `()`, so it can't be erased
         let component = if *is_transparent {
             body_expr
-        } else if cfg!(feature = "__internal_erase_components") {
+        } else if cfg!(feature = "__internal_erase_components")
+            && !matches!(ret, ReturnType::Default)
+        {
             quote! {
                 ::leptos::prelude::IntoMaybeErased::into_maybe_erased(
                     ::leptos::reactive::graph::untrack_with_diagnostics(
@@ -359,23 +393,11 @@ impl ToTokens for Model {
         let component = if is_island {
             let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
             quote! {
-                {
-                    if ::leptos::context::use_context::<::leptos::reactive::owner::IsHydrating>()
-                        .map(|h| h.0)
-                        .unwrap_or(false) {
-                        ::leptos::either::Either::Left(
-                            #component
-                        )
-                    } else {
-                        ::leptos::either::Either::Right(
-                            ::leptos::tachys::html::islands::Island::new(
-                                stringify!(#hydrate_fn_name),
-                                #component
-                            )
-                             #island_serialized_props
-                        )
-                    }
-                }
+                ::leptos::tachys::html::islands::Island::new(
+                    stringify!(#hydrate_fn_name),
+                    #component
+                )
+                #island_serialized_props
             }
         } else {
             component
@@ -542,15 +564,41 @@ impl ToTokens for Model {
             };
 
             let hydrate_fn_name = hydrate_fn_name.as_ref().unwrap();
-            quote! {
-                #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
-                #[allow(non_snake_case)]
-                pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
-                    #deserialize_island_props
-                    let island = #name(#island_props);
-                    let state = island.hydrate_from_position::<true>(&el, ::leptos::tachys::view::Position::Current);
-                    // TODO better cleanup
-                    std::mem::forget(state);
+
+            let hydrate_fn_inner = quote! {
+                #deserialize_island_props
+                let island = #name(#island_props);
+                let state = island.hydrate_from_position::<true>(&el, ::leptos::tachys::view::Position::Current);
+                // TODO better cleanup
+                std::mem::forget(state);
+            };
+            if *is_lazy {
+                let outer_name =
+                    Ident::new(&format!("{name}_loader"), name.span());
+
+                quote! {
+                    #[::leptos::prelude::lazy]
+                    #[allow(non_snake_case)]
+                    fn #outer_name (el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
+                    }
+
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(
+                        wasm_bindgen = ::leptos::wasm_bindgen,
+                        wasm_bindgen_futures = ::leptos::__reexports::wasm_bindgen_futures
+                    )]
+                    #[allow(non_snake_case)]
+                    pub async fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #outer_name(el).await
+                    }
+                }
+            } else {
+                quote! {
+                    #[::leptos::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::leptos::wasm_bindgen)]
+                    #[allow(non_snake_case)]
+                    pub fn #hydrate_fn_name(el: ::leptos::web_sys::HtmlElement) {
+                        #hydrate_fn_inner
+                    }
                 }
             }
         } else {
@@ -610,7 +658,7 @@ impl ToTokens for Model {
             }
         };
 
-        tokens.append_all(output)
+        Ok(output)
     }
 }
 
@@ -618,6 +666,13 @@ impl Model {
     #[allow(clippy::wrong_self_convention)]
     pub fn is_transparent(mut self, is_transparent: bool) -> Self {
         self.is_transparent = is_transparent;
+
+        self
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn is_lazy(mut self, is_lazy: bool) -> Self {
+        self.is_lazy = is_lazy;
 
         self
     }
@@ -645,11 +700,13 @@ impl Parse for DummyModel {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut attrs = input.call(Attribute::parse_outer)?;
         // Drop unknown attributes like #[deprecated]
-        drain_filter(&mut attrs, |attr| !attr.path().is_ident("doc"));
+        drain_filter(&mut attrs, |attr| {
+            !is_lint_attr(attr) && !attr.path().is_ident("doc")
+        });
 
         let vis: Visibility = input.parse()?;
         let mut sig: Signature = input.parse()?;
-        maybe_modify_return_type(&mut sig.output);
+        maybe_modify_return_type(&mut sig);
 
         // The body is left untouched, so it will not cause an error
         // even if the syntax is invalid.
@@ -717,18 +774,17 @@ struct Prop {
 }
 
 impl Prop {
-    fn new(arg: FnArg) -> Self {
+    fn new(arg: FnArg) -> syn::Result<Self> {
         let typed = if let FnArg::Typed(ty) = arg {
             ty
         } else {
-            abort!(arg, "receiver not allowed in `fn`");
+            return Err(syn::Error::new_spanned(
+                arg,
+                "receiver not allowed in `fn`",
+            ));
         };
 
-        let prop_opts =
-            PropOpt::from_attributes(&typed.attrs).unwrap_or_else(|e| {
-                // TODO: replace with `.unwrap_or_abort()` once https://gitlab.com/CreepySkeleton/proc-macro-error/-/issues/17 is fixed
-                abort!(e.span(), e.to_string());
-            });
+        let prop_opts = PropOpt::from_attributes(&typed.attrs)?;
 
         let name = match *typed.pat {
             Pat::Ident(i) => {
@@ -744,38 +800,37 @@ impl Prop {
                     i
                 }
             }
-            Pat::Struct(_) | Pat::Tuple(_) | Pat::TupleStruct(_) => {
-                if let Some(name) = &prop_opts.name {
-                    PatIdent {
-                        attrs: vec![],
-                        by_ref: None,
-                        mutability: None,
-                        ident: Ident::new(name, typed.pat.span()),
-                        subpat: None,
-                    }
-                } else {
-                    abort!(
-                        typed.pat,
+            pat @ (Pat::Struct(_) | Pat::Tuple(_) | Pat::TupleStruct(_)) => {
+                let Some(name) = prop_opts.name.as_deref() else {
+                    return Err(syn::Error::new_spanned(
+                        pat,
                         "destructured props must be given a name e.g. \
-                         #[prop(name = \"data\")]"
-                    );
+                         #[prop(name = \"data\")]",
+                    ));
+                };
+                PatIdent {
+                    attrs: vec![],
+                    by_ref: None,
+                    mutability: None,
+                    ident: Ident::new(name, pat.span()),
+                    subpat: None,
                 }
             }
-            _ => {
-                abort!(
-                    typed.pat,
+            pat => {
+                return Err(syn::Error::new_spanned(
+                    pat,
                     "only `prop: bool` style types are allowed within the \
-                     `#[component]` macro"
-                );
+                     `#[component]` macro",
+                ));
             }
         };
 
-        Self {
-            docs: Docs::new(&typed.attrs),
+        Ok(Self {
+            docs: Docs::new(&typed.attrs)?,
             prop_opts,
             name,
             ty: *typed.ty,
-        }
+        })
     }
 }
 
@@ -795,7 +850,7 @@ impl ToTokens for Docs {
 }
 
 impl Docs {
-    pub fn new(attrs: &[Attribute]) -> Self {
+    pub fn new(attrs: &[Attribute]) -> syn::Result<Self> {
         #[derive(Debug, Copy, Clone, PartialEq, Eq)]
         enum ViewCodeFenceState {
             Outside,
@@ -833,12 +888,12 @@ impl Docs {
                                 .trim_start();
                             vec![
                                 format!("{leading_ws}{quotes}{rust_options}"),
-                                format!("{leading_ws}"),
+                                leading_ws.to_string(),
                             ]
                         }
                         ViewCodeFenceState::Rust if trimmed_doc == quotes => {
                             view_code_fence_state = ViewCodeFenceState::Outside;
-                            vec![format!("{leading_ws}"), doc.to_owned()]
+                            vec![leading_ws.to_string(), doc.to_owned()]
                         }
                         ViewCodeFenceState::Rust
                             if trimmed_doc.starts_with('<') =>
@@ -873,15 +928,20 @@ impl Docs {
                     return None;
                 }
 
-                let Some(val) = value_to_string(&attr.value) else {
-                    abort!(
-                        attr,
-                        "expected string literal in value of doc comment"
-                    );
-                };
-
-                Some((val, attr.path.span()))
+                Some(
+                    value_to_string(&attr.value)
+                        .map(|val| (val, attr.path.span()))
+                        .ok_or_else(|| {
+                            syn::Error::new_spanned(
+                                attr,
+                                "expected string literal in value of doc \
+                                 comment",
+                            )
+                        }),
+                )
             })
+            .collect::<syn::Result<Vec<_>>>()?
+            .into_iter()
             .flat_map(map)
             .collect_vec();
 
@@ -894,7 +954,7 @@ impl Docs {
             attrs.push((format!("{quote_ws}{quotes}"), Span::call_site()))
         }
 
-        Self(attrs)
+        Ok(Self(attrs))
     }
 
     pub fn padded(&self) -> TokenStream {
@@ -926,6 +986,15 @@ impl Docs {
     }
 }
 
+fn is_lint_attr(attr: &Attribute) -> bool {
+    let path = &attr.path();
+    path.is_ident("allow")
+        || path.is_ident("warn")
+        || path.is_ident("expect")
+        || path.is_ident("deny")
+        || path.is_ident("forbid")
+}
+
 pub struct UnknownAttrs(Vec<(TokenStream, Span)>);
 
 impl UnknownAttrs {
@@ -933,10 +1002,14 @@ impl UnknownAttrs {
         let attrs = attrs
             .iter()
             .filter_map(|attr| {
-                if attr.path().is_ident("doc") {
-                    if let Meta::NameValue(_) = &attr.meta {
-                        return None;
-                    }
+                if attr.path().is_ident("doc")
+                    && let Meta::NameValue(_) = &attr.meta
+                {
+                    return None;
+                }
+
+                if is_lint_attr(attr) {
+                    return None;
                 }
 
                 Some((attr.into_token_stream(), attr.span()))
@@ -960,38 +1033,44 @@ impl ToTokens for UnknownAttrs {
 #[derive(Clone, Debug, FromAttr)]
 #[attribute(ident = prop)]
 struct PropOpt {
-    #[attribute(conflicts = [optional_no_strip, strip_option])]
+    #[attribute(conflicts = [optional_no_strip, strip_option, marker])]
     optional: bool,
-    #[attribute(conflicts = [optional, strip_option])]
+    #[attribute(conflicts = [optional, strip_option, marker])]
     optional_no_strip: bool,
-    #[attribute(conflicts = [optional, optional_no_strip])]
+    #[attribute(conflicts = [optional, optional_no_strip, marker])]
     strip_option: bool,
     #[attribute(example = "5 * 10")]
     default: Option<syn::Expr>,
     into: bool,
     attrs: bool,
     name: Option<String>,
+    #[attribute(conflicts = [optional, optional_no_strip, strip_option, default, into, attrs, name])]
+    marker: bool,
 }
 
-struct TypedBuilderOpts {
+struct TypedBuilderOpts<'a> {
+    marker: bool,
     default: bool,
     default_with_value: Option<syn::Expr>,
     strip_option: bool,
     into: bool,
+    ty: &'a Type,
 }
 
-impl TypedBuilderOpts {
-    fn from_opts(opts: &PropOpt, is_ty_option: bool) -> Self {
+impl<'a> TypedBuilderOpts<'a> {
+    fn from_opts(opts: &PropOpt, ty: &'a Type) -> Self {
         Self {
+            marker: opts.marker,
             default: opts.optional || opts.optional_no_strip || opts.attrs,
             default_with_value: opts.default.clone(),
-            strip_option: opts.strip_option || opts.optional && is_ty_option,
+            strip_option: opts.strip_option || opts.optional && is_option(ty),
             into: opts.into,
+            ty,
         }
     }
 }
 
-impl TypedBuilderOpts {
+impl TypedBuilderOpts<'_> {
     fn to_serde_tokens(&self) -> TokenStream {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
@@ -1010,8 +1089,14 @@ impl TypedBuilderOpts {
     }
 }
 
-impl ToTokens for TypedBuilderOpts {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl TypedBuilderOpts<'_> {
+    fn expand(&self) -> syn::Result<TokenStream> {
+        if self.marker {
+            return Ok(quote! {
+                #[builder(default, setter(skip))]
+            });
+        }
+
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
             quote! { default_code=#v, }
@@ -1021,14 +1106,29 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        let strip_option = if self.strip_option {
+        // If self.strip_option && self.into, then the strip_option will be represented as part of the transform closure.
+        let strip_option = if self.strip_option && !self.into {
             quote! { strip_option, }
         } else {
             quote! {}
         };
 
         let into = if self.into {
-            quote! { into, }
+            if !self.strip_option {
+                let ty = &self.ty;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> #ty {
+                        value.into_reactive_value()
+                    },
+                }
+            } else {
+                let ty = unwrap_option(self.ty)?;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> Option<#ty> {
+                        Some(value.into_reactive_value())
+                    },
+                }
+            }
         } else {
             quote! {}
         };
@@ -1045,7 +1145,7 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        tokens.append_all(output);
+        Ok(output)
     }
 }
 
@@ -1053,7 +1153,7 @@ fn prop_builder_fields(
     vis: &Visibility,
     props: &[Prop],
     is_island_with_other_props: bool,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     props
         .iter()
         .map(|prop| {
@@ -1064,34 +1164,36 @@ fn prop_builder_fields(
                 ty,
             } = prop;
 
+            let PatIdent { ident, by_ref, .. } = &name;
+
             let builder_attrs =
-                TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+                TypedBuilderOpts::from_opts(prop_opts, ty).expand()?;
 
-            let builder_docs = prop_to_doc(prop, PropDocStyle::Inline);
+            let builder_docs = prop_to_doc(prop, PropDocStyle::Inline)?;
 
-            // Children won't need documentation in many cases
-            let allow_missing_docs = if name.ident == "children" {
+            // Children and markers won't need documentation in many cases
+            let allow_missing_docs = if prop_opts.marker || ident == "children"
+            {
                 quote!(#[allow(missing_docs)])
             } else {
                 quote!()
             };
-            let skip_children_serde =
-                if is_island_with_other_props && name.ident == "children" {
-                    quote!(#[serde(skip)])
-                } else {
-                    quote!()
-                };
+            let serde_skip = if is_island_with_other_props
+                && (prop_opts.marker || ident == "children")
+            {
+                quote!(#[serde(skip)])
+            } else {
+                quote!()
+            };
 
-            let PatIdent { ident, by_ref, .. } = &name;
-
-            quote! {
+            Ok(quote! {
                 #docs
                 #builder_docs
                 #builder_attrs
                 #allow_missing_docs
-                #skip_children_serde
+                #serde_skip
                 #vis #by_ref #ident: #ty,
-            }
+            })
         })
         .collect()
 }
@@ -1110,8 +1212,7 @@ fn prop_serializer_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
                     ty,
                 } = prop;
 
-                let builder_attrs =
-                    TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+                let builder_attrs = TypedBuilderOpts::from_opts(prop_opts, ty);
                 let serde_attrs = builder_attrs.to_serde_tokens();
 
                 let PatIdent { ident, by_ref, .. } = &name;
@@ -1138,7 +1239,7 @@ fn prop_names(props: &[Prop]) -> TokenStream {
         .collect()
 }
 
-fn generate_component_fn_prop_docs(props: &[Prop]) -> TokenStream {
+fn generate_component_fn_prop_docs(props: &[Prop]) -> syn::Result<TokenStream> {
     let required_prop_docs = props
         .iter()
         .filter(|Prop { prop_opts, .. }| {
@@ -1146,8 +1247,9 @@ fn generate_component_fn_prop_docs(props: &[Prop]) -> TokenStream {
                 || prop_opts.optional_no_strip
                 || prop_opts.default.is_some())
         })
+        .filter(|prop| !prop.prop_opts.marker)
         .map(|p| prop_to_doc(p, PropDocStyle::List))
-        .collect::<TokenStream>();
+        .collect::<syn::Result<TokenStream>>()?;
 
     let optional_prop_docs = props
         .iter()
@@ -1156,8 +1258,9 @@ fn generate_component_fn_prop_docs(props: &[Prop]) -> TokenStream {
                 || prop_opts.optional_no_strip
                 || prop_opts.default.is_some()
         })
+        .filter(|prop| !prop.prop_opts.marker)
         .map(|p| prop_to_doc(p, PropDocStyle::List))
-        .collect::<TokenStream>();
+        .collect::<syn::Result<TokenStream>>()?;
 
     let required_prop_docs = if !required_prop_docs.is_empty() {
         quote! {
@@ -1177,10 +1280,10 @@ fn generate_component_fn_prop_docs(props: &[Prop]) -> TokenStream {
         quote! {}
     };
 
-    quote! {
+    Ok(quote! {
         #required_prop_docs
         #optional_prop_docs
-    }
+    })
 }
 
 pub fn is_option(ty: &Type) -> bool {
@@ -1199,7 +1302,7 @@ pub fn is_option(ty: &Type) -> bool {
     }
 }
 
-pub fn unwrap_option(ty: &Type) -> Type {
+pub fn unwrap_option(ty: &Type) -> syn::Result<Type> {
     const STD_OPTION_MSG: &str =
         "make sure you're not shadowing the `std::option::Option` type that \
          is automatically imported from the standard prelude";
@@ -1208,28 +1311,25 @@ pub fn unwrap_option(ty: &Type) -> Type {
         path: Path { segments, .. },
         ..
     }) = ty
+        && let [first] = &segments.iter().collect::<Vec<_>>()[..]
+        && first.ident == "Option"
+        && let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+            args,
+            ..
+        }) = &first.arguments
+        && let [GenericArgument::Type(ty)] =
+            &args.iter().collect::<Vec<_>>()[..]
     {
-        if let [first] = &segments.iter().collect::<Vec<_>>()[..] {
-            if first.ident == "Option" {
-                if let PathArguments::AngleBracketed(
-                    AngleBracketedGenericArguments { args, .. },
-                ) = &first.arguments
-                {
-                    if let [GenericArgument::Type(ty)] =
-                        &args.iter().collect::<Vec<_>>()[..]
-                    {
-                        return ty.clone();
-                    }
-                }
-            }
-        }
+        return Ok(ty.clone());
     }
 
-    abort!(
+    Err(syn::Error::new_spanned(
         ty,
-        "`Option` must be `std::option::Option`";
-        help = STD_OPTION_MSG
-    );
+        message_with_help(
+            "`Option` must be `std::option::Option`",
+            STD_OPTION_MSG,
+        ),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1246,10 +1346,10 @@ fn prop_to_doc(
         prop_opts,
     }: &Prop,
     style: PropDocStyle,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     let ty = if (prop_opts.optional || prop_opts.strip_option) && is_option(ty)
     {
-        unwrap_option(ty)
+        unwrap_option(ty)?
     } else {
         ty.to_owned()
     };
@@ -1260,6 +1360,7 @@ fn prop_to_doc(
 
     let file = syn::File {
         shebang: None,
+        frontmatter: None,
         attrs: vec![],
         items: vec![type_item],
     };
@@ -1284,10 +1385,10 @@ fn prop_to_doc(
 
             let arg_user_docs = docs.padded();
 
-            quote! {
+            Ok(quote! {
                 #[doc = #arg_ty_doc]
                 #arg_user_docs
-            }
+            })
         }
         PropDocStyle::Inline => {
             let arg_ty_doc = LitStr::new(
@@ -1309,15 +1410,18 @@ fn prop_to_doc(
                 name.ident.span(),
             );
 
-            quote! {
+            Ok(quote! {
                 #[builder(setter(doc = #arg_ty_doc))]
-            }
+            })
         }
     }
 }
 
 pub fn unmodified_fn_name_from_fn_name(ident: &Ident) -> Ident {
-    Ident::new(&format!("__{ident}"), ident.span())
+    Ident::new(
+        &format!("__component_{}", ident.to_string().to_case(Snake)),
+        ident.span(),
+    )
 }
 
 /// Converts all `impl Trait`s in a function signature to use generic params instead.
@@ -1335,6 +1439,7 @@ fn convert_impl_trait_to_generic(sig: &mut Signature) {
             if matches!(ty, Type::ImplTrait(_)) {
                 let ident = new_generic_ident(self.0.len(), ty.span());
                 let generic_type = Type::Path(TypePath {
+                    attrs: Vec::new(),
                     qself: None,
                     path: Path::from(ident),
                 });
@@ -1368,7 +1473,6 @@ fn convert_impl_trait_to_generic(sig: &mut Signature) {
             ident,
             colon_token: Some(Colon { spans: [span] }),
             bounds: impl_trait.bounds,
-            eq_token: None,
             default: None,
         }));
     }

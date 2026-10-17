@@ -1,12 +1,15 @@
-use crate::{codec::Post, ContentType, Decodes, Encodes};
-use bytes::Bytes;
+use crate::{
+    ContentType, Decodes, Encodes, Format, FormatType,
+    codec::{Patch, Post, Put},
+};
+use bytes::{Bytes, BytesMut};
 use rkyv::{
+    Archive, Deserialize, Serialize,
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
     rancor,
     ser::allocator::ArenaHandle,
     util::AlignedVec,
-    Archive, Deserialize, Serialize,
 };
 
 type RkyvSerializer<'a> =
@@ -21,6 +24,10 @@ impl ContentType for RkyvEncoding {
     const CONTENT_TYPE: &'static str = "application/rkyv";
 }
 
+impl FormatType for RkyvEncoding {
+    const FORMAT_TYPE: Format = Format::Binary;
+}
+
 impl<T> Encodes<T> for RkyvEncoding
 where
     T: Archive + for<'a> Serialize<RkyvSerializer<'a>>,
@@ -29,9 +36,17 @@ where
 {
     type Error = rancor::Error;
 
-    fn encode(value: T) -> Result<Bytes, Self::Error> {
-        let encoded = rkyv::to_bytes::<rancor::Error>(&value)?;
+    fn encode(value: &T) -> Result<Bytes, Self::Error> {
+        let encoded = rkyv::to_bytes::<rancor::Error>(value)?;
         Ok(Bytes::copy_from_slice(encoded.as_ref()))
+    }
+
+    fn encode_into(value: &T, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        // Copy the `AlignedVec` straight into the caller's buffer, skipping the
+        // intermediate `Bytes` that `encode` allocates and copies into.
+        let encoded = rkyv::to_bytes::<rancor::Error>(value)?;
+        buf.extend_from_slice(encoded.as_ref());
+        Ok(())
     }
 }
 
@@ -52,3 +67,13 @@ where
 
 /// Pass arguments and receive responses as `rkyv` in a `POST` request.
 pub type Rkyv = Post<RkyvEncoding>;
+
+/// Pass arguments and receive responses as `rkyv` in a `PATCH` request.
+/// **Note**: Browser support for `PATCH` requests without JS/WASM may be poor.
+/// Consider using a `POST` request if functionality without JS/WASM is required.
+pub type PatchRkyv = Patch<RkyvEncoding>;
+
+/// Pass arguments and receive responses as `rkyv` in a `PUT` request.
+/// **Note**: Browser support for `PUT` requests without JS/WASM may be poor.
+/// Consider using a `POST` request if functionality without JS/WASM is required.
+pub type PutRkyv = Put<RkyvEncoding>;

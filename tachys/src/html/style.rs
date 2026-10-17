@@ -1,12 +1,14 @@
 use super::attribute::{
-    maybe_next_attr_erasure_macros::next_attr_output_type, Attribute,
-    NextAttribute,
+    Attribute, NextAttribute,
+    maybe_next_attr_erasure_macros::next_attr_output_type,
 };
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 use crate::view::static_types::Static;
 use crate::{
-    html::attribute::maybe_next_attr_erasure_macros::next_attr_combine,
-    renderer::{dom::CssStyleDeclaration, Rndr},
+    html::attribute::{
+        NamedAttributeKey, maybe_next_attr_erasure_macros::next_attr_combine,
+    },
+    renderer::{Rndr, dom::CssStyleDeclaration},
     view::{Position, ToTemplate},
 };
 use std::{future::Future, sync::Arc};
@@ -99,6 +101,10 @@ where
         Style {
             style: self.style.resolve().await,
         }
+    }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::Attribute("style".into())]
     }
 }
 
@@ -661,7 +667,7 @@ impl_style_value!(String);
 #[cfg(feature = "oco")]
 impl_style_value!(oco_ref::Oco<'static, str>);
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const V: &'static str> IntoStyleValue for Static<V> {
     type AsyncOutput = Self;
     type State = Self;
@@ -707,7 +713,7 @@ impl<const V: &'static str> IntoStyleValue for Static<V> {
     }
 }
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const V: &'static str> IntoStyleValue for Option<Static<V>> {
     type AsyncOutput = Self;
     type State = Self;
@@ -764,7 +770,7 @@ impl<const V: &'static str> IntoStyleValue for Option<Static<V>> {
     }
 }
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const V: &'static str> IntoStyle for crate::view::static_types::Static<V> {
     type AsyncOutput = Self;
     type State = ();

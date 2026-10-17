@@ -31,7 +31,7 @@ impl AsPath for &'static str {
 /// ```rust
 /// # (|| -> Option<()> { // Option does not impl Terminate, so no main
 /// use leptos::prelude::*;
-/// use leptos_router::{path, PossibleRouteMatch, StaticSegment};
+/// use leptos_router::{PossibleRouteMatch, StaticSegment, path};
 ///
 /// let path = &"/users";
 ///
@@ -63,36 +63,61 @@ impl<T: AsPath> PossibleRouteMatch for StaticSegment<T> {
     }
 
     fn test<'a>(&self, path: &'a str) -> Option<PartialPathMatch<'a>> {
+        let segment = self.0.as_path();
+        let seg = segment.as_bytes();
+        let bytes = path.as_bytes();
         let mut matched_len = 0;
-        let mut test = path.chars().peekable();
-        let mut this = self.0.as_path().chars();
-        let mut has_matched =
-            self.0.as_path().is_empty() || self.0.as_path() == "/";
+        let mut path_idx = 0;
+        let mut seg_idx = 0;
+        let mut has_matched = segment.is_empty() || segment == "/";
 
         // match an initial /
-        if let Some('/') = test.peek() {
-            test.next();
+        if bytes.first() == Some(&b'/') {
+            path_idx += 1;
 
-            if !self.0.as_path().is_empty() {
+            if !segment.is_empty() {
                 matched_len += 1;
             }
-            if self.0.as_path().starts_with('/') || self.0.as_path().is_empty()
-            {
-                this.next();
+            if seg.first() == Some(&b'/') || segment.is_empty() {
+                seg_idx += 1;
             }
+        } else if !path.is_empty() {
+            // Path must start with `/` otherwise we are not certain about being at the beginning of the segment in the path
+            return None;
         }
 
-        for char in test {
-            let n = this.next();
+        // compare the path against the segment byte by byte: every comparison
+        // is an exact-equality check, and matching only stops at the ASCII `/`
+        // or at the end of the path or segment (both valid UTF-8), so
+        // `matched_len` always lands on a character boundary
+        while path_idx < bytes.len() {
+            let byte = bytes[path_idx];
+            path_idx += 1;
+            let expected = seg.get(seg_idx).copied();
+            seg_idx += 1;
             // when we get a closing /, stop matching
-            if char == '/' || n.is_none() {
+            if byte == b'/' {
+                if expected.is_some() {
+                    return None;
+                }
                 break;
+            } else if expected.is_none() {
+                // segment is exhausted but the path continues with a
+                // non-`/` byte: an overlong path must not match a shorter
+                // static segment (e.g. `/foobar` must not match `fo`).
+                // `""` and `"/"` are the exceptions: they are pass-through
+                // parents (e.g. nested wrapper routes) that consume nothing
+                // and leave the rest of the path to their children.
+                if segment.is_empty() || segment == "/" {
+                    break;
+                }
+                return None;
             }
-            // if the next character in the path matches the
-            // next character in the segment, add it to the match
-            else if Some(char) == n {
+            // if the next byte in the path matches the
+            // next byte in the segment, add it to the match
+            else if Some(byte) == expected {
                 has_matched = true;
-                matched_len += char.len_utf8();
+                matched_len += 1;
             }
             // otherwise, this route doesn't match and we should
             // return None
@@ -101,15 +126,22 @@ impl<T: AsPath> PossibleRouteMatch for StaticSegment<T> {
             }
         }
 
-        // if we still have remaining, unmatched characters in this segment, it was not a match
-        if this.next().is_some() {
+        // if we still have remaining, unmatched bytes in this segment, it was not a match
+        if seg_idx < seg.len() {
             return None;
         }
 
         // build the match object
-        // the remaining is built from the path in, with the slice moved
-        // by the length of this match
-        let (matched, remaining) = path.split_at(matched_len);
+        let (matched, remaining) = if matched_len == 1 && path.starts_with('/')
+        {
+            // If only thing that matched is `/` we can't eat it, otherwise next invocation of the
+            // test function will not be able to tell that we are matching from the beginning of the path segment
+            ("/", path)
+        } else {
+            // the remaining is built from the path in, with the slice moved
+            // by the length of this match
+            path.split_at(matched_len)
+        };
         has_matched.then(|| PartialPathMatch::new(remaining, vec![], matched))
     }
 
@@ -221,6 +253,17 @@ mod tests {
     }
 
     #[test]
+    fn allow_empty_match() {
+        let path = "";
+        let def = StaticSegment("");
+        let matched = def.test(path).expect("couldn't match route");
+        assert_eq!(matched.matched(), "");
+        assert_eq!(matched.remaining(), "");
+        let params = matched.params();
+        assert!(params.is_empty());
+    }
+
+    #[test]
     fn tuple_static_mismatch() {
         let path = "/foo/baz";
         let def = (StaticSegment("foo"), StaticSegment("bar"));
@@ -230,6 +273,13 @@ mod tests {
     #[test]
     fn tuple_static_mismatch_on_enum() {
         let path = "/foo/baz";
+        let def = (StaticSegment(Foo), StaticSegment(Bar));
+        assert!(def.test(path).is_none());
+    }
+
+    #[test]
+    fn dont_match_smooshed_segments() {
+        let path = "/foobar";
         let def = (StaticSegment(Foo), StaticSegment(Bar));
         assert!(def.test(path).is_none());
     }
@@ -268,5 +318,62 @@ mod tests {
         assert_eq!(matched.remaining(), "");
         let params = matched.params();
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn multi_byte_static_match() {
+        let path = "/héllo/x";
+        let def = StaticSegment("héllo");
+        let matched = def.test(path).expect("couldn't match route");
+        assert_eq!(matched.matched(), "/héllo");
+        assert_eq!(matched.remaining(), "/x");
+        let params = matched.params();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn multi_byte_static_mismatch() {
+        let def = StaticSegment("héllo");
+        assert!(def.test("/hélla").is_none());
+        assert!(def.test("/héll").is_none());
+        assert!(def.test("/h").is_none());
+    }
+
+    #[test]
+    fn mismatch_on_last_char() {
+        let def = StaticSegment("pricing");
+        assert!(def.test("/pricinX").is_none());
+    }
+
+    #[test]
+    fn only_match_full_static_paths() {
+        let def = (StaticSegment("tests"), StaticSegment("abc"));
+        assert!(def.test("/tes/abc").is_none());
+        assert!(def.test("/test/abc").is_none());
+        assert!(def.test("/tes/abc/").is_none());
+        assert!(def.test("/test/abc/").is_none());
+        assert!(def.test("/tests/ab").is_none());
+        assert!(def.test("/tests/ab/").is_none());
+    }
+
+    #[test]
+    fn no_partial_match_on_overlong_path() {
+        let def = StaticSegment("fo");
+        assert!(def.test("/foobar").is_none());
+    }
+
+    #[test]
+    fn empty_segment_is_passthrough_parent() {
+        let def = StaticSegment("");
+        let m = def
+            .test("/lang")
+            .expect("empty segment should pass through");
+        assert_eq!(m.matched(), "");
+        assert_eq!(m.remaining(), "/lang");
+
+        let def = StaticSegment("/");
+        let m = def.test("/lang").expect("root segment should pass through");
+        assert_eq!(m.matched(), "/");
+        assert_eq!(m.remaining(), "/lang");
     }
 }

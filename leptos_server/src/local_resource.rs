@@ -1,30 +1,32 @@
 use reactive_graph::{
     computed::{
-        suspense::LocalResourceNotifier, ArcAsyncDerived, AsyncDerived,
-        AsyncDerivedFuture,
+        ArcAsyncDerived, AsyncDerived, AsyncDerivedFuture,
+        suspense::LocalResourceNotifier,
     },
     graph::{
         AnySource, AnySubscriber, ReactiveNode, Source, Subscriber,
         ToAnySource, ToAnySubscriber,
     },
     owner::use_context,
+    send_wrapper_ext::SendOption,
     signal::{
-        guards::{AsyncPlain, ReadGuard},
         ArcRwSignal, RwSignal,
+        guards::{AsyncPlain, Mapped, ReadGuard},
     },
     traits::{
-        DefinedAt, IsDisposed, ReadUntracked, Track, Update, With, Write,
+        DefinedAt, IsDisposed, Notify, ReadUntracked, Track, UntrackableGuard,
+        Update, With, Write,
     },
 };
-use send_wrapper::SendWrapper;
 use std::{
-    future::{pending, Future, IntoFuture},
+    future::{Future, IntoFuture, pending},
+    ops::{Deref, DerefMut},
     panic::Location,
 };
 
 /// A reference-counted resource that only loads its data locally on the client.
 pub struct ArcLocalResource<T> {
-    data: ArcAsyncDerived<SendWrapper<T>>,
+    data: ArcAsyncDerived<T>,
     refetch: ArcRwSignal<usize>,
     #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
@@ -38,6 +40,14 @@ impl<T> Clone for ArcLocalResource<T> {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: self.defined_at,
         }
+    }
+}
+
+impl<T> Deref for ArcLocalResource<T> {
+    type Target = ArcAsyncDerived<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
     }
 }
 
@@ -62,7 +72,7 @@ impl<T> ArcLocalResource<T> {
                     pending().await
                 } else {
                     // LocalResources that are immediately available can cause a hydration error,
-                    // because the future *looks* like it is alredy ready (and therefore would
+                    // because the future *looks* like it is already ready (and therefore would
                     // already have been rendered to html on the server), but in fact was ignored
                     // on the server. the simplest way to avoid this is to ensure that we always
                     // wait a tick before resolving any value for a localresource.
@@ -71,18 +81,18 @@ impl<T> ArcLocalResource<T> {
                 }
             }
         };
-        let fetcher = SendWrapper::new(fetcher);
         let refetch = ArcRwSignal::new(0);
-        let data = {
-            let refetch = refetch.clone();
-            ArcAsyncDerived::new(move || {
-                refetch.track();
-                let fut = fetcher();
-                SendWrapper::new(async move { SendWrapper::new(fut.await) })
-            })
-        };
+
         Self {
-            data,
+            data: if cfg!(feature = "ssr") {
+                ArcAsyncDerived::new_mock(fetcher)
+            } else {
+                let refetch = refetch.clone();
+                ArcAsyncDerived::new_unsync(move || {
+                    refetch.track();
+                    fetcher()
+                })
+            },
             refetch,
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
@@ -97,7 +107,7 @@ impl<T> ArcLocalResource<T> {
     /// Synchronously, reactively reads the current value of the resource and applies the function
     /// `f` to its value if it is `Some(_)`.
     #[track_caller]
-    pub fn map<U>(&self, f: impl FnOnce(&SendWrapper<T>) -> U) -> Option<U>
+    pub fn map<U>(&self, f: impl FnOnce(&T) -> U) -> Option<U>
     where
         T: 'static,
     {
@@ -128,14 +138,9 @@ where
     T: Clone + 'static,
 {
     type Output = T;
-    type IntoFuture = futures::future::Map<
-        AsyncDerivedFuture<SendWrapper<T>>,
-        fn(SendWrapper<T>) -> T,
-    >;
+    type IntoFuture = AsyncDerivedFuture<T>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use futures::FutureExt;
-
         if let Some(mut notifier) = use_context::<LocalResourceNotifier>() {
             notifier.notify();
         } else if cfg!(feature = "ssr") {
@@ -145,7 +150,7 @@ where
                  always pending on the server."
             );
         }
-        self.data.into_future().map(|value| (*value).clone())
+        self.data.into_future()
     }
 }
 
@@ -162,12 +167,38 @@ impl<T> DefinedAt for ArcLocalResource<T> {
     }
 }
 
+impl<T> Notify for ArcLocalResource<T>
+where
+    T: 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T> Write for ArcLocalResource<T>
+where
+    T: 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
 impl<T> ReadUntracked for ArcLocalResource<T>
 where
     T: 'static,
 {
     type Value =
-        ReadGuard<Option<SendWrapper<T>>, AsyncPlain<Option<SendWrapper<T>>>>;
+        ReadGuard<Option<T>, Mapped<AsyncPlain<SendOption<T>>, Option<T>>>;
 
     fn try_read_untracked(&self) -> Option<Self::Value> {
         if let Some(mut notifier) = use_context::<LocalResourceNotifier>() {
@@ -240,10 +271,18 @@ impl<T> Subscriber for ArcLocalResource<T> {
 
 /// A resource that only loads its data locally on the client.
 pub struct LocalResource<T> {
-    data: AsyncDerived<SendWrapper<T>>,
+    data: AsyncDerived<T>,
     refetch: RwSignal<usize>,
     #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
+}
+
+impl<T> Deref for LocalResource<T> {
+    type Target = AsyncDerived<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 impl<T> Clone for LocalResource<T> {
@@ -275,7 +314,7 @@ impl<T> LocalResource<T> {
                     pending().await
                 } else {
                     // LocalResources that are immediately available can cause a hydration error,
-                    // because the future *looks* like it is alredy ready (and therefore would
+                    // because the future *looks* like it is already ready (and therefore would
                     // already have been rendered to html on the server), but in fact was ignored
                     // on the server. the simplest way to avoid this is to ensure that we always
                     // wait a tick before resolving any value for a localresource.
@@ -290,11 +329,9 @@ impl<T> LocalResource<T> {
             data: if cfg!(feature = "ssr") {
                 AsyncDerived::new_mock(fetcher)
             } else {
-                let fetcher = SendWrapper::new(fetcher);
-                AsyncDerived::new(move || {
+                AsyncDerived::new_unsync_threadsafe_storage(move || {
                     refetch.track();
-                    let fut = fetcher();
-                    SendWrapper::new(async move { SendWrapper::new(fut.await) })
+                    fetcher()
                 })
             },
             refetch,
@@ -307,6 +344,34 @@ impl<T> LocalResource<T> {
     pub fn refetch(&self) {
         self.refetch.try_update(|n| *n += 1);
     }
+
+    /// Synchronously, reactively reads the current value of the resource and applies the function
+    /// `f` to its value if it is `Some(_)`.
+    #[track_caller]
+    pub fn map<U>(&self, f: impl FnOnce(&T) -> U) -> Option<U>
+    where
+        T: 'static,
+    {
+        self.data.try_with(|n| n.as_ref().map(f))?
+    }
+}
+
+impl<T, E> LocalResource<Result<T, E>>
+where
+    T: 'static,
+    E: Clone + 'static,
+{
+    /// Applies the given function when a resource that returns `Result<T, E>`
+    /// has resolved and loaded an `Ok(_)`, rather than requiring nested `.map()`
+    /// calls over the `Option<Result<_, _>>` returned by the resource.
+    ///
+    /// This is useful when used with features like server functions, in conjunction
+    /// with `<ErrorBoundary/>` and `<Suspense/>`, when these other components are
+    /// left to handle the `None` and `Err(_)` states.
+    #[track_caller]
+    pub fn and_then<U>(&self, f: impl FnOnce(&T) -> U) -> Option<Result<U, E>> {
+        self.map(|data| data.as_ref().map(f).map_err(|e| e.clone()))
+    }
 }
 
 impl<T> IntoFuture for LocalResource<T>
@@ -314,14 +379,9 @@ where
     T: Clone + 'static,
 {
     type Output = T;
-    type IntoFuture = futures::future::Map<
-        AsyncDerivedFuture<SendWrapper<T>>,
-        fn(SendWrapper<T>) -> T,
-    >;
+    type IntoFuture = AsyncDerivedFuture<T>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use futures::FutureExt;
-
         if let Some(mut notifier) = use_context::<LocalResourceNotifier>() {
             notifier.notify();
         } else if cfg!(feature = "ssr") {
@@ -331,7 +391,7 @@ where
                  always pending on the server."
             );
         }
-        self.data.into_future().map(|value| (*value).clone())
+        self.data.into_future()
     }
 }
 
@@ -348,12 +408,38 @@ impl<T> DefinedAt for LocalResource<T> {
     }
 }
 
+impl<T> Notify for LocalResource<T>
+where
+    T: 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T> Write for LocalResource<T>
+where
+    T: 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
 impl<T> ReadUntracked for LocalResource<T>
 where
     T: 'static,
 {
     type Value =
-        ReadGuard<Option<SendWrapper<T>>, AsyncPlain<Option<SendWrapper<T>>>>;
+        ReadGuard<Option<T>, Mapped<AsyncPlain<SendOption<T>>, Option<T>>>;
 
     fn try_read_untracked(&self) -> Option<Self::Value> {
         if let Some(mut notifier) = use_context::<LocalResourceNotifier>() {

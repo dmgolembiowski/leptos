@@ -18,23 +18,26 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::{
+    Sink,
     stream::{self, Stream},
-    Sink, StreamExt,
 };
 use http::{Request, Response};
 use std::borrow::Cow;
 
-impl<E> Req<E> for Request<Bytes>
+impl<Error, InputStreamError, OutputStreamError>
+    Req<Error, InputStreamError, OutputStreamError> for Request<Bytes>
 where
-    E: FromServerFnError + Send,
+    Error: FromServerFnError + Send,
+    InputStreamError: FromServerFnError + Send,
+    OutputStreamError: FromServerFnError + Send,
 {
     type WebsocketResponse = Response<Bytes>;
 
-    async fn try_into_bytes(self) -> Result<Bytes, E> {
+    async fn try_into_bytes(self) -> Result<Bytes, Error> {
         Ok(self.into_body())
     }
 
-    async fn try_into_string(self) -> Result<String, E> {
+    async fn try_into_string(self) -> Result<String, Error> {
         String::from_utf8(self.into_body().into()).map_err(|err| {
             ServerFnErrorErr::Deserialization(err.to_string()).into_app_error()
         })
@@ -42,10 +45,13 @@ where
 
     fn try_into_stream(
         self,
-    ) -> Result<impl Stream<Item = Result<Bytes, E>> + Send + 'static, E> {
-        Ok(stream::iter(self.into_body())
-            .ready_chunks(16)
-            .map(|chunk| Ok(Bytes::from(chunk))))
+    ) -> Result<impl Stream<Item = Result<Bytes, Bytes>> + Send + 'static, Error>
+    {
+        // The body is a single, contiguous, already-in-memory `Bytes`. Hand it
+        // back as one stream item instead of iterating it `u8`-by-`u8` and
+        // re-chunking, which would cost `N` polls plus `N/16` re-allocations and
+        // a full copy of a buffer we already own.
+        Ok(stream::once(async move { Ok(self.into_body()) }))
     }
 
     fn to_content_type(&self) -> Option<Cow<'_, str>> {
@@ -74,21 +80,25 @@ where
         self,
     ) -> Result<
         (
-            impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-            impl Sink<Result<Bytes, E>> + Send + 'static,
+            impl Stream<Item = Result<Bytes, Bytes>> + Send + 'static,
+            impl Sink<Bytes> + Send + 'static,
+            impl std::future::Future<Output = ()> + Send + 'static,
             Self::WebsocketResponse,
         ),
-        E,
+        Error,
     > {
         Err::<
             (
-                futures::stream::Once<std::future::Ready<Result<Bytes, E>>>,
-                futures::sink::Drain<Result<Bytes, E>>,
+                futures::stream::Once<std::future::Ready<Result<Bytes, Bytes>>>,
+                futures::sink::Drain<Bytes>,
+                std::future::Pending<()>,
                 Self::WebsocketResponse,
             ),
             _,
-        >(E::from_server_fn_error(crate::ServerFnErrorErr::Response(
-            "Websockets are not supported on this platform.".to_string(),
-        )))
+        >(Error::from_server_fn_error(
+            crate::ServerFnErrorErr::Response(
+                "Websockets are not supported on this platform.".to_string(),
+            ),
+        ))
     }
 }

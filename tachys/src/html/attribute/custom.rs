@@ -1,16 +1,16 @@
 use super::{
-    maybe_next_attr_erasure_macros::next_attr_output_type, NextAttribute,
+    NextAttribute, maybe_next_attr_erasure_macros::next_attr_output_type,
 };
 use crate::{
     html::attribute::{
-        maybe_next_attr_erasure_macros::next_attr_combine, Attribute,
-        AttributeValue,
+        Attribute, AttributeValue, NamedAttributeKey,
+        maybe_next_attr_erasure_macros::next_attr_combine,
     },
-    view::{add_attr::AddAnyAttr, Position, ToTemplate},
+    view::{Position, ToTemplate, add_attr::AddAnyAttr},
 };
 use std::{borrow::Cow, sync::Arc};
 
-/// Adds a custom attribute with any key-value combintion.
+/// Adds a custom attribute with any key-value combination.
 #[inline(always)]
 pub fn custom_attribute<K, V>(key: K, value: V) -> CustomAttr<K, V>
 where
@@ -112,6 +112,12 @@ where
             value: self.value.resolve().await,
         }
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::Attribute(
+            self.key.as_ref().to_string().into(),
+        )]
+    }
 }
 
 impl<K, V> NextAttribute for CustomAttr<K, V>
@@ -170,7 +176,7 @@ impl CustomAttributeKey for Arc<str> {
     const KEY: &'static str = "";
 }
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const K: &'static str> CustomAttributeKey
     for crate::view::static_types::Static<K>
 {
@@ -182,7 +188,6 @@ pub trait CustomAttribute<K, V>
 where
     K: CustomAttributeKey,
     V: AttributeValue,
-
     Self: Sized + AddAnyAttr,
 {
     /// Adds an HTML attribute by key and value.

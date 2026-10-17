@@ -1,5 +1,5 @@
 use or_poisoned::OrPoisoned;
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 #[cfg(feature = "sandboxed-arenas")]
 use std::cell::RefCell;
 #[cfg(not(feature = "sandboxed-arenas"))]
@@ -49,19 +49,29 @@ impl Arena {
         }
         #[cfg(feature = "sandboxed-arenas")]
         {
+            Arena::try_with(fun).unwrap_or_else(|| {
+                panic!(
+                    "at {}, the `sandboxed-arenas` feature is active, but no \
+                     Arena is active",
+                    std::panic::Location::caller()
+                )
+            })
+        }
+    }
+
+    #[track_caller]
+    pub fn try_with<U>(fun: impl FnOnce(&ArenaMap) -> U) -> Option<U> {
+        #[cfg(not(feature = "sandboxed-arenas"))]
+        {
+            Some(fun(&MAP.get_or_init(Default::default).read().or_poisoned()))
+        }
+        #[cfg(feature = "sandboxed-arenas")]
+        {
             MAP.with_borrow(|arena| {
-                fun(&arena
+                arena
                     .as_ref()
                     .and_then(Weak::upgrade)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "at {}, the `sandboxed-arenas` feature is active, \
-                             but no Arena is active",
-                            std::panic::Location::caller()
-                        )
-                    })
-                    .read()
-                    .or_poisoned())
+                    .map(|n| fun(&n.read().or_poisoned()))
             })
         }
     }
@@ -74,20 +84,32 @@ impl Arena {
         }
         #[cfg(feature = "sandboxed-arenas")]
         {
-            let caller = std::panic::Location::caller();
+            Arena::try_with_mut(fun).unwrap_or_else(|| {
+                panic!(
+                    "at {}, the `sandboxed-arenas` feature is active, but no \
+                     Arena is active",
+                    std::panic::Location::caller()
+                )
+            })
+        }
+    }
+
+    #[track_caller]
+    pub fn try_with_mut<U>(fun: impl FnOnce(&mut ArenaMap) -> U) -> Option<U> {
+        #[cfg(not(feature = "sandboxed-arenas"))]
+        {
+            Some(fun(&mut MAP
+                .get_or_init(Default::default)
+                .write()
+                .or_poisoned()))
+        }
+        #[cfg(feature = "sandboxed-arenas")]
+        {
             MAP.with_borrow(|arena| {
-                fun(&mut arena
+                arena
                     .as_ref()
                     .and_then(Weak::upgrade)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "at {}, the `sandboxed-arenas` feature is active, \
-                             but no Arena is active",
-                            caller
-                        )
-                    })
-                    .write()
-                    .or_poisoned())
+                    .map(|n| fun(&mut n.write().or_poisoned()))
             })
         }
     }
@@ -126,9 +148,31 @@ pub mod sandboxed {
         /// called.
         ///
         /// [item]:[crate::owner::ArenaItem]
+        #[track_caller]
         pub fn new(inner: T) -> Self {
             let arena = MAP.with_borrow(|n| n.as_ref().and_then(Weak::upgrade));
             Self { arena, inner }
+        }
+    }
+
+    /// RAII guard that snapshots the current thread-local arena and restores it
+    /// on drop, so polling a `Sandboxed` future does not leak its arena into the
+    /// caller's context (including across `await` points and panics).
+    struct RestoreArena(Option<Weak<RwLock<ArenaMap>>>);
+
+    impl Drop for RestoreArena {
+        fn drop(&mut self) {
+            MAP.with_borrow_mut(|m| *m = self.0.take());
+        }
+    }
+
+    impl RestoreArena {
+        fn install(arena: Option<&Arc<RwLock<ArenaMap>>>) -> Self {
+            let guard = MAP.with_borrow(|m| RestoreArena(m.clone()));
+            if let Some(arena) = arena {
+                Arena::set(arena);
+            }
+            guard
         }
     }
 
@@ -142,9 +186,7 @@ pub mod sandboxed {
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Self::Output> {
-            if let Some(arena) = self.arena.as_ref() {
-                Arena::set(arena);
-            }
+            let _restore = RestoreArena::install(self.arena.as_ref());
             let this = self.project();
             this.inner.poll(cx)
         }
@@ -160,9 +202,7 @@ pub mod sandboxed {
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
         ) -> Poll<Option<Self::Item>> {
-            if let Some(arena) = self.arena.as_ref() {
-                Arena::set(arena);
-            }
+            let _restore = RestoreArena::install(self.arena.as_ref());
             let this = self.project();
             this.inner.poll_next(cx)
         }

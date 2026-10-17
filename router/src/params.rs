@@ -36,6 +36,26 @@ impl ParamsMap {
         }
     }
 
+    /// Inserts an already-decoded value into the map without performing an
+    /// additional percent-decoding pass.
+    ///
+    /// Query-string pairs are produced pre-decoded by both the browser's
+    /// `URLSearchParams` (client) and the `url` crate's `query_pairs` (server).
+    /// Routing them through [`insert`](Self::insert) would decode them a second
+    /// time, corrupting any value that legitimately contains a `%xx` sequence.
+    pub(crate) fn insert_decoded(
+        &mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: String,
+    ) {
+        let key = key.into();
+        if let Some(prev) = self.0.iter_mut().find(|(k, _)| k == &key) {
+            prev.1.push(value);
+        } else {
+            self.0.push((key, vec![value]));
+        }
+    }
+
     /// Inserts a value into the map, replacing any existing value for that key.
     pub fn replace(
         &mut self,
@@ -63,6 +83,16 @@ impl ParamsMap {
         self.0
             .iter()
             .find_map(|(k, v)| if k == key { Some(v.clone()) } else { None })
+    }
+
+    /// Gets an iterator for all the most-recently-added values on the map
+    pub fn latest_values(&self) -> ParamsMapIterRef<'_> {
+        let inner: Vec<_> = self
+            .0
+            .iter()
+            .flat_map(|(k, v)| v.last().map(|v| (k, v.as_str())))
+            .collect();
+        ParamsMapIterRef(inner.into_iter())
     }
 
     /// Gets a reference to the most-recently-added value of this param from the map.
@@ -138,6 +168,20 @@ impl IntoIterator for ParamsMap {
     }
 }
 
+impl<'a> IntoIterator for &'a ParamsMap {
+    type Item = (&'a Cow<'static, str>, &'a str);
+    type IntoIter = ParamsMapIterRef<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let inner: Vec<_> = self
+            .0
+            .iter()
+            .flat_map(|(k, v)| v.iter().map(move |v| (k, v.as_str())))
+            .collect();
+        ParamsMapIterRef(inner.into_iter())
+    }
+}
+
 /// An iterator over the keys and values of a [`ParamsMap`].
 #[derive(Debug)]
 pub struct ParamsMapIter(
@@ -146,6 +190,20 @@ pub struct ParamsMapIter(
 
 impl Iterator for ParamsMapIter {
     type Item = (Cow<'static, str>, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+/// An iterator over the references of the keys and values of a [`ParamsMap`].
+#[derive(Debug)]
+pub struct ParamsMapIterRef<'a>(
+    <Vec<(&'a Cow<'static, str>, &'a str)> as IntoIterator>::IntoIter,
+);
+
+impl<'a> Iterator for ParamsMapIterRef<'a> {
+    type Item = (&'a Cow<'static, str>, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
@@ -161,12 +219,42 @@ where
 {
     /// Attempts to deserialize the map into the given type.
     fn from_map(map: &ParamsMap) -> Result<Self, ParamsError>;
+
+    /// Attempts to create Params map from given type.
+    fn to_map(&self) -> Result<ParamsMap, ParamsError>;
 }
 
 impl Params for () {
     #[inline(always)]
     fn from_map(_map: &ParamsMap) -> Result<Self, ParamsError> {
         Ok(())
+    }
+
+    #[inline(always)]
+    fn to_map(&self) -> Result<ParamsMap, ParamsError> {
+        Ok(ParamsMap::new())
+    }
+}
+
+/// Helper trait that converts a typed Parameter for the URL into an Option of a
+/// String to be used in the ParamsMap
+pub trait ParamToString
+where
+    Self: Sized,
+{
+    /// Convert a typed Parameter for the URL into an Option of a String
+    fn param_to_string(&self, name: &str) -> Option<String>;
+}
+
+/// Helper trait that converts a typed Parameter for the URL into an Option of a
+/// String to be used in the ParamsMap
+impl<T> ParamToString for Option<T>
+where
+    T: ToString,
+{
+    /// Convert a typed Parameter for the URL into an Option of a String
+    fn param_to_string(&self, _name: &str) -> Option<String> {
+        self.as_ref().map(|value| value.to_string())
     }
 }
 
@@ -177,7 +265,7 @@ where
 {
     /// Converts the param.
     fn into_param(value: Option<&str>, name: &str)
-        -> Result<Self, ParamsError>;
+    -> Result<Self, ParamsError>;
 }
 
 impl<T> IntoParam for Option<T>
@@ -199,31 +287,73 @@ where
     }
 }
 
-// TODO can we support Option<T> and T in a non-nightly way?
-#[cfg(feature = "nightly")]
-mod option_param {
-    use super::{IntoParam, ParamsError};
+/// Helpers for the `Params` derive macro to allow specialization without nightly.
+pub mod macro_helpers {
+    use crate::params::{IntoParam, ParamToString, ParamsError};
     use std::{str::FromStr, sync::Arc};
 
-    auto trait NotOption {}
-    impl<T> !NotOption for Option<T> {}
+    /// This struct is never actually created; it just exists so that we can impl associated
+    /// functions on it.
+    pub struct Wrapper<T>(T);
 
-    impl<T> IntoParam for T
-    where
-        T: FromStr + NotOption,
-        <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
-    {
-        fn into_param(
+    impl<T: IntoParam> Wrapper<T> {
+        /// This is the 'preferred' impl to be used for all `T` that implement `IntoParam`.
+        /// Because it is directly on the struct, the compiler will pick this over the impl from
+        /// the `Fallback` trait.
+        #[inline]
+        pub fn __into_param(
             value: Option<&str>,
             name: &str,
-        ) -> Result<Self, ParamsError> {
-            let value = value
-                .ok_or_else(|| ParamsError::MissingParam(name.to_string()))?;
-            Self::from_str(value).map_err(|e| ParamsError::Params(Arc::new(e)))
+        ) -> Result<T, ParamsError> {
+            T::into_param(value, name)
         }
     }
-}
 
+    impl<T: ParamToString> Wrapper<T> {
+        /// This is the 'preferred' impl to be used for all `T` that implement `ParamToString`.
+        /// Because it is directly on the struct, the compiler will pick this over the impl from
+        /// the `Fallback` trait.
+        #[inline]
+        pub fn __param_to_string(value: &T, name: &str) -> Option<String> {
+            T::param_to_string(value, name)
+        }
+    }
+
+    /// If the Fallback trait is in scope, then the compiler has two possible implementations for
+    /// `__into_params`. It will pick the one from this trait if the inherent one doesn't exist.
+    /// (which it won't if `T` does not implement `IntoParam`)
+    pub trait Fallback<T>: Sized
+    where
+        T: FromStr + ToString,
+        <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+    {
+        /// Fallback function in case the inherent impl on the Wrapper struct does not exist for
+        /// `T`
+        #[inline]
+        fn __into_param(
+            value: Option<&str>,
+            name: &str,
+        ) -> Result<T, ParamsError> {
+            let value = value
+                .ok_or_else(|| ParamsError::MissingParam(name.to_string()))?;
+            T::from_str(value).map_err(|e| ParamsError::Params(Arc::new(e)))
+        }
+
+        /// Fallback function in case the inherent impl on the Wrapper struct does not exist for
+        /// `T`
+        #[inline]
+        fn __param_to_string(value: &T, _name: &str) -> Option<String> {
+            Some(T::to_string(value))
+        }
+    }
+
+    impl<T> Fallback<T> for Wrapper<T>
+    where
+        T: FromStr + ToString,
+        <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+    {
+    }
+}
 /// Errors that can occur while parsing params using [`Params`].
 #[derive(Error, Debug, Clone)]
 pub enum ParamsError {

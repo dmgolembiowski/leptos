@@ -6,7 +6,13 @@
 // this is specifically used for `unsized_const_params` below
 // this allows us to use const generic &'static str for static text nodes and attributes
 #![allow(incomplete_features)]
-#![cfg_attr(feature = "nightly", feature(unsized_const_params))]
+#![cfg_attr(
+    all(feature = "nightly", rustc_nightly),
+    feature(unsized_const_params)
+)]
+// support for const generic &'static str has now moved back and forth between
+// these two features a couple times; we'll just enable both
+#![cfg_attr(all(feature = "nightly", rustc_nightly), feature(adt_const_params))]
 #![deny(missing_docs)]
 
 /// Commonly-used traits.
@@ -14,6 +20,7 @@ pub mod prelude {
     pub use crate::{
         html::{
             attribute::{
+                IntoAttributeValue,
                 any_attribute::IntoAnyAttribute,
                 aria::AriaAttributes,
                 custom::CustomAttribute,
@@ -22,17 +29,16 @@ pub mod prelude {
                     OnAttribute, OnTargetAttribute, PropAttribute,
                     StyleAttribute,
                 },
-                IntoAttributeValue,
             },
             directive::DirectiveAttribute,
             element::{ElementChild, ElementExt, InnerHtmlAttribute},
             node_ref::NodeRefAttribute,
         },
-        renderer::{dom::Dom, Renderer},
+        renderer::{Renderer, dom::Dom},
         view::{
+            IntoRender, Mountable, Render, RenderHtml,
             add_attr::AddAnyAttr,
             any_view::{AnyView, IntoAny, IntoMaybeErased},
-            IntoRender, Mountable, Render, RenderHtml,
         },
     };
 }

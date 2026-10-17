@@ -1,12 +1,12 @@
 use crate::component::{
-    convert_from_snake_case, drain_filter, is_option, unwrap_option, Docs,
+    Docs, convert_from_snake_case, drain_filter, is_option, unwrap_option,
 };
 use attribute_derive::FromAttr;
 use proc_macro2::{Ident, TokenStream};
-use quote::{quote, ToTokens, TokenStreamExt};
+use quote::{ToTokens, quote};
 use syn::{
-    parse::Parse, parse_quote, Field, ItemStruct, LitStr, Meta, Type,
-    Visibility,
+    Field, ItemStruct, LitStr, Meta, Type, Visibility, parse::Parse,
+    parse_quote,
 };
 
 pub struct Model {
@@ -21,14 +21,14 @@ impl Parse for Model {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let mut item = ItemStruct::parse(input)?;
 
-        let docs = Docs::new(&item.attrs);
+        let docs = Docs::new(&item.attrs)?;
 
         let props = item
             .fields
             .clone()
             .into_iter()
             .map(Prop::new)
-            .collect::<Vec<_>>();
+            .collect::<syn::Result<Vec<_>>>()?;
 
         // We need to remove the `#[doc = ""]` and `#[builder(_)]`
         // attrs from the function signature
@@ -55,8 +55,8 @@ impl Parse for Model {
     }
 }
 
-impl ToTokens for Model {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl Model {
+    pub(crate) fn expand(&self) -> syn::Result<TokenStream> {
         let Self {
             docs,
             vis,
@@ -67,8 +67,8 @@ impl ToTokens for Model {
 
         let (_, generics, where_clause) = body.generics.split_for_impl();
 
-        let prop_builder_fields = prop_builder_fields(vis, props);
-        let prop_docs = generate_prop_docs(props);
+        let prop_builder_fields = prop_builder_fields(vis, props)?;
+        let prop_docs = generate_prop_docs(props)?;
         let builder_name_doc = LitStr::new(
             &format!("Props for the [`{name}`] slot."),
             name.span(),
@@ -106,7 +106,7 @@ impl ToTokens for Model {
             }*/
         };
 
-        tokens.append_all(output)
+        Ok(output)
     }
 }
 
@@ -118,29 +118,23 @@ struct Prop {
 }
 
 impl Prop {
-    fn new(arg: Field) -> Self {
-        let prop_opts =
-            PropOpt::from_attributes(&arg.attrs).unwrap_or_else(|e| {
-                // TODO: replace with `.unwrap_or_abort()` once https://gitlab.com/CreepySkeleton/proc-macro-error/-/issues/17 is fixed
-                abort!(e.span(), e.to_string());
-            });
+    fn new(arg: Field) -> syn::Result<Self> {
+        let prop_opts = PropOpt::from_attributes(&arg.attrs)?;
 
-        let name = if let Some(i) = arg.ident {
-            i
-        } else {
-            abort!(
-                arg.ident,
+        let Some(name) = arg.ident.clone() else {
+            return Err(syn::Error::new_spanned(
+                &arg,
                 "only `prop: bool` style types are allowed within the \
-                 `#[slot]` macro"
-            );
+                 `#[slot]` macro",
+            ));
         };
 
-        Self {
-            docs: Docs::new(&arg.attrs),
+        Ok(Self {
+            docs: Docs::new(&arg.attrs)?,
             prop_opts,
             name,
             ty: arg.ty,
-        }
+        })
     }
 }
 
@@ -159,26 +153,28 @@ struct PropOpt {
     pub attrs: bool,
 }
 
-struct TypedBuilderOpts {
+struct TypedBuilderOpts<'a> {
     default: bool,
     default_with_value: Option<syn::Expr>,
     strip_option: bool,
     into: bool,
+    ty: &'a Type,
 }
 
-impl TypedBuilderOpts {
-    pub fn from_opts(opts: &PropOpt, is_ty_option: bool) -> Self {
+impl<'a> TypedBuilderOpts<'a> {
+    pub fn from_opts(opts: &PropOpt, ty: &'a Type) -> Self {
         Self {
             default: opts.optional || opts.optional_no_strip || opts.attrs,
             default_with_value: opts.default.clone(),
-            strip_option: opts.strip_option || opts.optional && is_ty_option,
+            strip_option: opts.strip_option || opts.optional && is_option(ty),
             into: opts.into,
+            ty,
         }
     }
 }
 
-impl ToTokens for TypedBuilderOpts {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
+impl TypedBuilderOpts<'_> {
+    fn expand(&self) -> syn::Result<TokenStream> {
         let default = if let Some(v) = &self.default_with_value {
             let v = v.to_token_stream().to_string();
             quote! { default_code=#v, }
@@ -188,14 +184,29 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        let strip_option = if self.strip_option {
+        // If self.strip_option && self.into, then the strip_option will be represented as part of the transform closure.
+        let strip_option = if self.strip_option && !self.into {
             quote! { strip_option, }
         } else {
             quote! {}
         };
 
         let into = if self.into {
-            quote! { into, }
+            if !self.strip_option {
+                let ty = &self.ty;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> #ty {
+                        value.into_reactive_value()
+                    },
+                }
+            } else {
+                let ty = unwrap_option(self.ty)?;
+                quote! {
+                    fn transform<__IntoReactiveValueMarker>(value: impl ::leptos::prelude::IntoReactiveValue<#ty, __IntoReactiveValueMarker>) -> Option<#ty> {
+                        Some(value.into_reactive_value())
+                    },
+                }
+            }
         } else {
             quote! {}
         };
@@ -212,11 +223,14 @@ impl ToTokens for TypedBuilderOpts {
             quote! {}
         };
 
-        tokens.append_all(output);
+        Ok(output)
     }
 }
 
-fn prop_builder_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
+fn prop_builder_fields(
+    vis: &Visibility,
+    props: &[Prop],
+) -> syn::Result<TokenStream> {
     props
         .iter()
         .map(|prop| {
@@ -228,28 +242,28 @@ fn prop_builder_fields(vis: &Visibility, props: &[Prop]) -> TokenStream {
             } = prop;
 
             let builder_attrs =
-                TypedBuilderOpts::from_opts(prop_opts, is_option(ty));
+                TypedBuilderOpts::from_opts(prop_opts, ty).expand()?;
 
-            let builder_docs = prop_to_doc(prop, PropDocStyle::Inline);
+            let builder_docs = prop_to_doc(prop, PropDocStyle::Inline)?;
 
-            quote! {
+            Ok(quote! {
                 #docs
                 #builder_docs
                 #builder_attrs
                 #vis #name: #ty,
-            }
+            })
         })
         .collect()
 }
 
-fn generate_prop_docs(props: &[Prop]) -> TokenStream {
+fn generate_prop_docs(props: &[Prop]) -> syn::Result<TokenStream> {
     let required_prop_docs = props
         .iter()
         .filter(|Prop { prop_opts, .. }| {
             !(prop_opts.optional || prop_opts.optional_no_strip)
         })
         .map(|p| prop_to_doc(p, PropDocStyle::List))
-        .collect::<TokenStream>();
+        .collect::<syn::Result<TokenStream>>()?;
 
     let optional_prop_docs = props
         .iter()
@@ -257,7 +271,7 @@ fn generate_prop_docs(props: &[Prop]) -> TokenStream {
             prop_opts.optional || prop_opts.optional_no_strip
         })
         .map(|p| prop_to_doc(p, PropDocStyle::List))
-        .collect::<TokenStream>();
+        .collect::<syn::Result<TokenStream>>()?;
 
     let required_prop_docs = if !required_prop_docs.is_empty() {
         quote! {
@@ -277,10 +291,10 @@ fn generate_prop_docs(props: &[Prop]) -> TokenStream {
         quote! {}
     };
 
-    quote! {
+    Ok(quote! {
         #required_prop_docs
         #optional_prop_docs
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -297,10 +311,10 @@ fn prop_to_doc(
         prop_opts,
     }: &Prop,
     style: PropDocStyle,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     let ty = if (prop_opts.optional || prop_opts.strip_option) && is_option(ty)
     {
-        unwrap_option(ty)
+        unwrap_option(ty)?
     } else {
         ty.to_owned()
     };
@@ -311,6 +325,7 @@ fn prop_to_doc(
 
     let file = syn::File {
         shebang: None,
+        frontmatter: None,
         attrs: vec![],
         items: vec![type_item],
     };
@@ -336,10 +351,10 @@ fn prop_to_doc(
 
             let arg_user_docs = docs.padded();
 
-            quote! {
+            Ok(quote! {
                 #[doc = #arg_ty_doc]
                 #arg_user_docs
-            }
+            })
         }
         PropDocStyle::Inline => {
             let arg_ty_doc = LitStr::new(
@@ -361,9 +376,9 @@ fn prop_to_doc(
                 name.span(),
             );
 
-            quote! {
+            Ok(quote! {
                 #[builder(setter(doc = #arg_ty_doc))]
-            }
+            })
         }
     }
 }

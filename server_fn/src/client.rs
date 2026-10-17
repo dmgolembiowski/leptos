@@ -8,8 +8,27 @@ static ROOT_URL: OnceLock<&'static str> = OnceLock::new();
 /// Set the root server URL that all server function paths are relative to for the client.
 ///
 /// If this is not set, it defaults to the origin.
+///
+/// # Panics
+///
+/// Panics if the server URL has already been set. Setting it twice is almost
+/// always a bug: requests would otherwise be silently sent to a different URL
+/// than intended. If you need to handle the already-set case gracefully, use
+/// [`try_set_server_url`] instead.
 pub fn set_server_url(url: &'static str) {
     ROOT_URL.set(url).unwrap();
+}
+
+/// Attempts to set the root server URL that all server function paths are
+/// relative to for the client.
+///
+/// Unlike [`set_server_url`], this does not panic if the URL has already been
+/// set. Instead it returns `Err` containing the `url` that could not be set,
+/// leaving the previously set value unchanged.
+///
+/// If this is not set, it defaults to the origin.
+pub fn try_set_server_url(url: &'static str) -> Result<(), &'static str> {
+    ROOT_URL.set(url)
 }
 
 /// Returns the root server URL for all server functions.
@@ -23,16 +42,16 @@ pub fn get_server_url() -> &'static str {
 /// This trait is implemented for things like a browser `fetch` request or for
 /// the `reqwest` trait. It should almost never be necessary to implement it
 /// yourself, unless you’re trying to use an alternative HTTP crate on the client side.
-pub trait Client<E> {
+pub trait Client<Error, InputStreamError = Error, OutputStreamError = Error> {
     /// The type of a request sent by this client.
-    type Request: ClientReq<E> + Send + 'static;
+    type Request: ClientReq<Error> + Send + 'static;
     /// The type of a response received by this client.
-    type Response: ClientRes<E> + Send + 'static;
+    type Response: ClientRes<Error> + Send + 'static;
 
     /// Sends the request and receives a response.
     fn send(
         req: Self::Request,
-    ) -> impl Future<Output = Result<Self::Response, E>> + Send;
+    ) -> impl Future<Output = Result<Self::Response, Error>> + Send;
 
     /// Opens a websocket connection to the server.
     #[allow(clippy::type_complexity)]
@@ -41,10 +60,10 @@ pub trait Client<E> {
     ) -> impl Future<
         Output = Result<
             (
-                impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-                impl Sink<Result<Bytes, E>> + Send + 'static,
+                impl Stream<Item = Result<Bytes, Bytes>> + Send + 'static,
+                impl Sink<Bytes> + Send + 'static,
             ),
-            E,
+            Error,
         >,
     > + Send;
 
@@ -55,49 +74,55 @@ pub trait Client<E> {
 #[cfg(feature = "browser")]
 /// Implements [`Client`] for a `fetch` request in the browser.
 pub mod browser {
-    use super::Client;
+    use super::{Client, get_server_url};
     use crate::{
         error::{FromServerFnError, IntoAppError, ServerFnErrorErr},
         request::browser::{BrowserRequest, RequestInner},
         response::browser::BrowserResponse,
     };
     use bytes::Bytes;
-    use futures::{Sink, SinkExt, StreamExt, TryStreamExt};
-    use gloo_net::websocket::{events::CloseEvent, Message, WebSocketError};
+    use futures::{Sink, SinkExt, StreamExt};
+    use gloo_net::websocket::{Message, WebSocketError};
     use send_wrapper::SendWrapper;
     use std::future::Future;
 
     /// Implements [`Client`] for a `fetch` request in the browser.
     pub struct BrowserClient;
 
-    impl<E: FromServerFnError> Client<E> for BrowserClient {
+    impl<
+        Error: FromServerFnError,
+        InputStreamError: FromServerFnError,
+        OutputStreamError: FromServerFnError,
+    > Client<Error, InputStreamError, OutputStreamError> for BrowserClient
+    {
         type Request = BrowserRequest;
         type Response = BrowserResponse;
 
         fn send(
             req: Self::Request,
-        ) -> impl Future<Output = Result<Self::Response, E>> + Send {
+        ) -> impl Future<Output = Result<Self::Response, Error>> + Send
+        {
             SendWrapper::new(async move {
                 let req = req.0.take();
                 let RequestInner {
                     request,
                     mut abort_ctrl,
                 } = req;
-                let res = request
-                    .send()
-                    .await
-                    .map(|res| BrowserResponse(SendWrapper::new(res)))
-                    .map_err(|e| {
-                        ServerFnErrorErr::Request(e.to_string())
-                            .into_app_error()
-                    });
-
-                // at this point, the future has successfully resolved without being dropped, so we
-                // can prevent the `AbortController` from firing
-                if let Some(ctrl) = abort_ctrl.as_mut() {
-                    ctrl.prevent_cancellation();
+                match request.send().await {
+                    // Headers can arrive before the body, so keep cancellation
+                    // armed until the response body has been read.
+                    Ok(res) => Ok(BrowserResponse(
+                        SendWrapper::new(res),
+                        SendWrapper::new(abort_ctrl),
+                    )),
+                    Err(e) => {
+                        if let Some(ctrl) = abort_ctrl.as_mut() {
+                            ctrl.prevent_cancellation();
+                        }
+                        Err(ServerFnErrorErr::Request(e.to_string())
+                            .into_app_error())
+                    }
                 }
-                res
             })
         }
 
@@ -106,34 +131,49 @@ pub mod browser {
         ) -> impl Future<
             Output = Result<
                 (
-                    impl futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
-                    impl futures::Sink<Result<Bytes, E>> + Send + 'static,
+                    impl futures::Stream<Item = Result<Bytes, Bytes>>
+                    + Send
+                    + 'static,
+                    impl futures::Sink<Bytes> + Send + 'static,
                 ),
-                E,
+                Error,
             >,
         > + Send {
+            let mut websocket_server_url = get_server_url().to_string();
+            if let Some(postfix) = websocket_server_url.strip_prefix("http://")
+            {
+                websocket_server_url = format!("ws://{postfix}");
+            } else if let Some(postfix) =
+                websocket_server_url.strip_prefix("https://")
+            {
+                websocket_server_url = format!("wss://{postfix}");
+            }
+            let url = format!("{websocket_server_url}{url}");
             SendWrapper::new(async move {
                 let websocket =
-                    gloo_net::websocket::futures::WebSocket::open(url)
+                    gloo_net::websocket::futures::WebSocket::open(&url)
                         .map_err(|err| {
                             web_sys::console::error_1(&err.to_string().into());
-                            E::from_server_fn_error(ServerFnErrorErr::Request(
-                                err.to_string(),
-                            ))
+                            Error::from_server_fn_error(
+                                ServerFnErrorErr::Request(err.to_string()),
+                            )
                         })?;
                 let (sink, stream) = websocket.split();
 
-                let stream = stream
-                    .map_err(|err| {
-                        web_sys::console::error_1(&err.to_string().into());
-                        E::from_server_fn_error(ServerFnErrorErr::Request(
-                            err.to_string(),
-                        ))
-                    })
-                    .map_ok(move |msg| match msg {
+                let stream = stream.map(|message| match message {
+                    Ok(message) => Ok(match message {
                         Message::Text(text) => Bytes::from(text),
                         Message::Bytes(bytes) => Bytes::from(bytes),
-                    });
+                    }),
+                    Err(err) => {
+                        web_sys::console::error_1(&err.to_string().into());
+                        Err(OutputStreamError::from_server_fn_error(
+                            ServerFnErrorErr::Request(err.to_string()),
+                        )
+                        .ser()
+                        .body)
+                    }
+                });
                 let stream = SendWrapper::new(stream);
 
                 struct SendWrapperSink<S> {
@@ -186,21 +226,10 @@ pub mod browser {
                     }
                 }
 
-                let sink = sink.with(|message: Result<Bytes, E>| async move {
-                    match message {
-                        Ok(message) => Ok(Message::Bytes(message.into())),
-                        Err(err) => {
-                            web_sys::console::error_1(&js_sys::JsString::from(
-                                err.ser(),
-                            ));
-                            const CLOSE_CODE_ERROR: u16 = 1011;
-                            Err(WebSocketError::ConnectionClose(CloseEvent {
-                                code: CLOSE_CODE_ERROR,
-                                reason: err.ser(),
-                                was_clean: true,
-                            }))
-                        }
-                    }
+                let sink = sink.with(|message: Bytes| async move {
+                    Ok::<Message, WebSocketError>(Message::Bytes(
+                        message.into(),
+                    ))
                 });
                 let sink = SendWrapperSink::new(Box::pin(sink));
 
@@ -217,7 +246,7 @@ pub mod browser {
 #[cfg(feature = "reqwest")]
 /// Implements [`Client`] for a request made by [`reqwest`].
 pub mod reqwest {
-    use super::{get_server_url, Client};
+    use super::{Client, get_server_url};
     use crate::{
         error::{FromServerFnError, IntoAppError, ServerFnErrorErr},
         request::reqwest::CLIENT,
@@ -230,13 +259,19 @@ pub mod reqwest {
     /// Implements [`Client`] for a request made by [`reqwest`].
     pub struct ReqwestClient;
 
-    impl<E: FromServerFnError + Send + 'static> Client<E> for ReqwestClient {
+    impl<
+        Error: FromServerFnError,
+        InputStreamError: FromServerFnError,
+        OutputStreamError: FromServerFnError,
+    > Client<Error, InputStreamError, OutputStreamError> for ReqwestClient
+    {
         type Request = Request;
         type Response = Response;
 
         fn send(
             req: Self::Request,
-        ) -> impl Future<Output = Result<Self::Response, E>> + Send {
+        ) -> impl Future<Output = Result<Self::Response, Error>> + Send
+        {
             CLIENT.execute(req).map_err(|e| {
                 ServerFnErrorErr::Request(e.to_string()).into_app_error()
             })
@@ -246,26 +281,24 @@ pub mod reqwest {
             path: &str,
         ) -> Result<
             (
-                impl futures::Stream<Item = Result<bytes::Bytes, E>>
-                    + Send
-                    + 'static,
-                impl futures::Sink<Result<bytes::Bytes, E>> + Send + 'static,
+                impl futures::Stream<Item = Result<Bytes, Bytes>> + Send + 'static,
+                impl futures::Sink<Bytes> + Send + 'static,
             ),
-            E,
+            Error,
         > {
             let mut websocket_server_url = get_server_url().to_string();
             if let Some(postfix) = websocket_server_url.strip_prefix("http://")
             {
-                websocket_server_url = format!("ws://{}", postfix);
+                websocket_server_url = format!("ws://{postfix}");
             } else if let Some(postfix) =
                 websocket_server_url.strip_prefix("https://")
             {
-                websocket_server_url = format!("wss://{}", postfix);
+                websocket_server_url = format!("wss://{postfix}");
             }
-            let url = format!("{}{}", websocket_server_url, path);
+            let url = format!("{websocket_server_url}{path}");
             let (ws_stream, _) =
                 tokio_tungstenite::connect_async(url).await.map_err(|e| {
-                    E::from_server_fn_error(ServerFnErrorErr::Request(
+                    Error::from_server_fn_error(ServerFnErrorErr::Request(
                         e.to_string(),
                     ))
                 })?;
@@ -275,23 +308,19 @@ pub mod reqwest {
             Ok((
                 read.map(|msg| match msg {
                     Ok(msg) => Ok(msg.into_data()),
-                    Err(e) => Err(E::from_server_fn_error(
+                    Err(e) => Err(OutputStreamError::from_server_fn_error(
                         ServerFnErrorErr::Request(e.to_string()),
-                    )),
+                    )
+                    .ser()
+                    .body),
                 }),
-                write.with(|msg: Result<Bytes, E>| async move {
-                    match msg {
-                        Ok(msg) => {
-                            Ok(tokio_tungstenite::tungstenite::Message::Binary(
-                                msg,
-                            ))
-                        }
-                        Err(e) => {
-                            Err(tokio_tungstenite::tungstenite::Error::Io(
-                                std::io::Error::other(e.ser()),
-                            ))
-                        }
-                    }
+                write.with(|msg: Bytes| async move {
+                    Ok::<
+                        tokio_tungstenite::tungstenite::Message,
+                        tokio_tungstenite::tungstenite::Error,
+                    >(
+                        tokio_tungstenite::tungstenite::Message::Binary(msg)
+                    )
                 }),
             ))
         }

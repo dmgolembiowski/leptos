@@ -1,22 +1,23 @@
 use crate::{
-    html::attribute::{any_attribute::AnyAttribute, Attribute},
+    html::attribute::{Attribute, any_attribute::AnyAttribute},
     hydration::Cursor,
     ssr::StreamBuilder,
     view::{
-        add_attr::AddAnyAttr, iterators::OptionState, Mountable, Position,
-        PositionState, Render, RenderHtml,
+        Mountable, Position, PositionState, Render, RenderFlags, RenderHtml,
+        add_attr::AddAnyAttr, iterators::OptionState,
     },
 };
 use any_spawner::Executor;
 use futures::{
+    FutureExt,
     future::{AbortHandle, Abortable},
-    select, FutureExt,
+    select,
 };
 use or_poisoned::OrPoisoned;
 use reactive_graph::{
     computed::{
-        suspense::{LocalResourceNotifier, SuspenseContext},
         ScopedFuture,
+        suspense::{LocalResourceNotifier, SuspenseContext},
     },
     graph::{
         AnySource, AnySubscriber, Observer, ReactiveNode, Source, Subscriber,
@@ -296,21 +297,14 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         // TODO wrap this with a Suspense as needed
         // currently this is just used for Routes, which creates a Suspend but never actually needs
         // it (because we don't lazy-load routes on the server)
         if let Some(inner) = self.inner.now_or_never() {
-            inner.to_html_with_buf(
-                buf,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs,
-            );
+            inner.to_html_with_buf(buf, position, flags, extra_attrs);
         }
     }
 
@@ -318,8 +312,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -329,8 +322,7 @@ where
             Some(inner) => inner.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs,
             ),
             None => {
@@ -355,7 +347,7 @@ where
                         buf.push_fallback::<()>(
                             (),
                             &mut fallback_position,
-                            mark_branches,
+                            flags.mark_branches,
                             extra_attrs.clone(),
                         );
 
@@ -367,7 +359,7 @@ where
                         buf.push_async_out_of_order(
                             fut,
                             position,
-                            mark_branches,
+                            flags.mark_branches,
                             extra_attrs,
                         );
                     } else {
@@ -379,8 +371,7 @@ where
                                 value.to_html_async_with_buf::<OUT_OF_ORDER>(
                                     &mut builder,
                                     &mut position,
-                                    escape,
-                                    mark_branches,
+                                    flags,
                                     extra_attrs,
                                 );
                                 builder.finish().take_chunks()
@@ -449,6 +440,39 @@ where
         SuspendState { inner }
     }
 
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let Self { subscriber, inner } = self;
+
+        // create a Future that will be aborted on on_cleanup
+        // this prevents trying to access signals or other resources inside the Suspend, after the
+        // await, if they have already been cleaned up
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        let mut fut = Box::pin(Abortable::new(inner, abort_registration));
+        on_cleanup(move || abort_handle.abort());
+
+        // poll the future once immediately
+        let value = match fut.as_mut().now_or_never().and_then(Result::ok) {
+            Some(value) => Some(value),
+            None => {
+                let id =
+                    use_context::<SuspenseContext>().map(|sc| sc.task_id());
+                let value = fut.as_mut().await.ok();
+                drop(id);
+                value
+            }
+        };
+
+        // if pending, wait so we hydrate the real value against the server's HTML
+        let inner =
+            Rc::new(RefCell::new(value.hydrate_async(cursor, position).await));
+        subscriber.forward();
+        SuspendState { inner }
+    }
+
     async fn resolve(self) -> Self::AsyncOutput {
         Some(self.inner.await)
     }
@@ -468,7 +492,8 @@ where
         //
         // in this case, though, we can simply... discover that the data are already here, and then
         // stuff them back into a new Future, which can safely be polled after its completion
-        if let Some(inner) = self.inner.as_mut().now_or_never() {
+        if let Some(mut inner) = self.inner.as_mut().now_or_never() {
+            inner.dry_resolve();
             self.inner = Box::pin(async move { inner })
                 as Pin<Box<dyn Future<Output = T> + Send>>;
         }

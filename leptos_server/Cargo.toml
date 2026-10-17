@@ -1,8 +1,6 @@
 [package]
 name = "leptos_server"
-# TODO revert to { workspace = true } before 0.8.0 release
-# this is a hack because I missing bumping the hydration_context version number before publishing
-version = "0.8.0-alpha2"
+version = "0.9.0-rc0"
 authors = ["Greg Johnston"]
 license = "MIT"
 repository = "https://github.com/leptos-rs/leptos"
@@ -12,24 +10,32 @@ rust-version.workspace = true
 edition.workspace = true
 
 [dependencies]
-base64 = "0.22.1"
-codee = { version = "0.3.0", features = ["json_serde"] }
+base64 = { workspace = true, default-features = true }
+codee = { features = ["json_serde"], workspace = true, default-features = true }
 hydration_context = { workspace = true }
 reactive_graph = { workspace = true, features = ["hydration"] }
 server_fn = { workspace = true }
-tracing = { version = "0.1.41", optional = true }
-futures = "0.3.31"
+tracing = { optional = true, workspace = true, default-features = true }
+futures = { workspace = true, default-features = true }
 
 any_spawner = { workspace = true }
 or_poisoned = { workspace = true }
 tachys = { workspace = true, optional = true, features = ["reactive_graph"] }
-send_wrapper = "0.6"
+send_wrapper = { workspace = true, default-features = true }
 
 # serialization formats
-serde = { version = "1.0" }
-js-sys = { version = "0.3.74", optional = true }
-wasm-bindgen = { version = "0.2.100", optional = true }
-serde_json = { workspace = true }
+serde = { workspace = true, default-features = true }
+js-sys = { optional = true, workspace = true, default-features = true }
+wasm-bindgen = { workspace = true, optional = true, default-features = true }
+serde_json = { workspace = true, default-features = true }
+
+[dev-dependencies]
+tokio = { features = [
+  "rt-multi-thread",
+  "macros",
+  "time",
+], workspace = true, default-features = true }
+any_spawner = { workspace = true, features = ["futures-executor", "tokio"] }
 
 [features]
 ssr = []
@@ -43,9 +49,11 @@ tracing = ["dep:tracing"]
 
 [package.metadata.cargo-all-features]
 denylist = ["tracing"]
+max_combination_size = 2
 
 [package.metadata.docs.rs]
-rustdoc-args = ["--generate-link-to-definition"]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition", "--cfg", "docsrs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(leptos_debuginfo)'] }

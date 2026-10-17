@@ -1,7 +1,6 @@
 mod api;
 use crate::api::*;
-use leptos::either::Either;
-use leptos::prelude::*;
+use leptos::{either::Either, prelude::*};
 use leptos_router::{
     components::{
         Form, Outlet, ParentRoute, ProtectedRoute, Redirect, Route, Router,
@@ -24,7 +23,7 @@ pub fn RouterExample() -> impl IntoView {
     // contexts are passed down through the route tree
     provide_context(ExampleContext(0));
 
-    // this signal will be ued to set whether we are allowed to access a protected route
+    // this signal will be used to set whether we are allowed to access a protected route
     let (logged_in, set_logged_in) = signal(true);
     let (is_routing, set_is_routing) = signal(false);
 

@@ -1,12 +1,12 @@
 use crate::{
+    KeyMap, StoreFieldTrigger,
     path::{StorePath, StorePathSegment},
     store_field::StoreField,
-    KeyMap, StoreFieldTrigger,
 };
 use reactive_graph::{
     signal::{
-        guards::{Mapped, MappedMut, MappedMutArc, WriteGuard},
         ArcTrigger,
+        guards::{Mapped, MappedMut, MappedMutArc, WriteGuard},
     },
     traits::{
         DefinedAt, IsDisposed, Notify, ReadUntracked, Track, UntrackableGuard,
@@ -14,19 +14,132 @@ use reactive_graph::{
     },
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
     hash::Hash,
     iter,
-    ops::{Deref, DerefMut, IndexMut},
+    ops::{Deref, DerefMut, Index, IndexMut},
     panic::Location,
 };
+
+/// A trait that provides the iterator item type for keyed collections.
+/// This uses a GAT to express the lifetime-parameterized item type,
+/// avoiding problematic struct-level bounds on `IntoIterator` that can
+/// conflict with other crates' blanket implementations.
+pub trait KeyedIterable {
+    /// The iterator item type when borrowing the collection with lifetime `'a`.
+    type IterItem<'a>
+    where
+        Self: 'a;
+}
+
+impl<T> KeyedIterable for Vec<T> {
+    type IterItem<'a>
+        = &'a T
+    where
+        Self: 'a;
+}
+
+impl<T> KeyedIterable for [T] {
+    type IterItem<'a>
+        = &'a T
+    where
+        Self: 'a;
+}
+
+impl<T, const N: usize> KeyedIterable for [T; N] {
+    type IterItem<'a>
+        = &'a T
+    where
+        Self: 'a;
+}
+
+impl<K, V> KeyedIterable for HashMap<K, V> {
+    type IterItem<'a>
+        = (&'a K, &'a V)
+    where
+        Self: 'a;
+}
+
+impl<K, V> KeyedIterable for BTreeMap<K, V> {
+    type IterItem<'a>
+        = (&'a K, &'a V)
+    where
+        Self: 'a;
+}
+
+impl<T> KeyedIterable for VecDeque<T> {
+    type IterItem<'a>
+        = &'a T
+    where
+        Self: 'a;
+}
+
+/// Accesses an item from a keyed collection.
+///
+/// `K` is the identity key type used to uniquely identify entries. Collections
+/// that are indexed by position (like `Vec`) can implement this for any `K`,
+/// ignoring the key and using the `index` parameter instead. Collections that
+/// are indexed by key (like `HashMap`) use the `key` parameter.
+pub trait KeyedAccess<K> {
+    /// Collection values.
+    type Value;
+    /// Acquire read-only access to a value.
+    fn keyed(&self, index: usize, key: &K) -> &Self::Value;
+    /// Acquire mutable access to a value.
+    fn keyed_mut(&mut self, index: usize, key: &K) -> &mut Self::Value;
+}
+impl<K, T> KeyedAccess<K> for VecDeque<T> {
+    type Value = T;
+    fn keyed(&self, index: usize, _key: &K) -> &Self::Value {
+        self.index(index)
+    }
+    fn keyed_mut(&mut self, index: usize, _key: &K) -> &mut Self::Value {
+        self.index_mut(index)
+    }
+}
+impl<K, T> KeyedAccess<K> for Vec<T> {
+    type Value = T;
+    fn keyed(&self, index: usize, _key: &K) -> &Self::Value {
+        self.index(index)
+    }
+    fn keyed_mut(&mut self, index: usize, _key: &K) -> &mut Self::Value {
+        self.index_mut(index)
+    }
+}
+impl<K, T> KeyedAccess<K> for [T] {
+    type Value = T;
+    fn keyed(&self, index: usize, _key: &K) -> &Self::Value {
+        self.index(index)
+    }
+    fn keyed_mut(&mut self, index: usize, _key: &K) -> &mut Self::Value {
+        self.index_mut(index)
+    }
+}
+impl<K: Ord, V> KeyedAccess<K> for std::collections::BTreeMap<K, V> {
+    type Value = V;
+    fn keyed(&self, _index: usize, key: &K) -> &Self::Value {
+        self.get(key).expect("key does not exist")
+    }
+    fn keyed_mut(&mut self, _index: usize, key: &K) -> &mut Self::Value {
+        self.get_mut(key).expect("key does not exist")
+    }
+}
+impl<K: Hash + Eq, V> KeyedAccess<K> for std::collections::HashMap<K, V> {
+    type Value = V;
+    fn keyed(&self, _index: usize, key: &K) -> &Self::Value {
+        self.get(key).expect("key does not exist")
+    }
+    fn keyed_mut(&mut self, _index: usize, key: &K) -> &mut Self::Value {
+        self.get_mut(key).expect("key does not exist")
+    }
+}
 
 /// Provides access to a subfield that contains some kind of keyed collection.
 #[derive(Debug)]
 pub struct KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
 {
     #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
@@ -34,12 +147,12 @@ where
     inner: Inner,
     read: fn(&Prev) -> &T,
     write: fn(&mut Prev) -> &mut T,
-    key_fn: fn(<&T as IntoIterator>::Item) -> K,
+    pub(crate) key_fn: for<'a> fn(<T as KeyedIterable>::IterItem<'a>) -> K,
 }
 
 impl<Inner, Prev, K, T> Clone for KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     Inner: Clone,
 {
     fn clone(&self) -> Self {
@@ -57,21 +170,21 @@ where
 
 impl<Inner, Prev, K, T> Copy for KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     Inner: Copy,
 {
 }
 
 impl<Inner, Prev, K, T> KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
 {
     /// Creates a keyed subfield of the inner data type with the given key function.
     #[track_caller]
     pub fn new(
         inner: Inner,
         path_segment: StorePathSegment,
-        key_fn: fn(<&T as IntoIterator>::Item) -> K,
+        key_fn: for<'a> fn(<T as KeyedIterable>::IterItem<'a>) -> K,
         read: fn(&Prev) -> &T,
         write: fn(&mut Prev) -> &mut T,
     ) -> Self {
@@ -90,14 +203,15 @@ where
 impl<Inner, Prev, K, T> StoreField for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
 {
     type Value = T;
     type Reader = Mapped<Inner::Reader, T>;
-    type Writer = MappedMut<WriteGuard<ArcTrigger, Inner::Writer>, T>;
+    type Writer = MappedMut<WriteGuard<Vec<ArcTrigger>, Inner::Writer>, T>;
 
     fn path(&self) -> impl IntoIterator<Item = StorePathSegment> {
         self.inner
@@ -106,8 +220,19 @@ where
             .chain(iter::once(self.path_segment))
     }
 
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        self.inner
+            .path_unkeyed()
+            .into_iter()
+            .chain(iter::once(self.path_segment))
+    }
+
     fn get_trigger(&self, path: StorePath) -> StoreFieldTrigger {
         self.inner.get_trigger(path)
+    }
+
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner.get_trigger_unkeyed(path)
     }
 
     fn reader(&self) -> Option<Self::Reader> {
@@ -116,9 +241,10 @@ where
     }
 
     fn writer(&self) -> Option<Self::Writer> {
-        let path = self.path().into_iter().collect::<StorePath>();
-        let trigger = self.get_trigger(path.clone());
-        let guard = WriteGuard::new(trigger.children, self.inner.writer()?);
+        let mut parent = self.inner.writer()?;
+        parent.untrack();
+        let triggers = self.triggers_for_current_path();
+        let guard = WriteGuard::new(triggers, parent);
         Some(MappedMut::new(guard, self.read, self.write))
     }
 
@@ -128,20 +254,28 @@ where
     }
 
     fn track_field(&self) {
-        let inner = self
-            .inner
-            .get_trigger(self.inner.path().into_iter().collect());
-        inner.this.track();
+        let mut full_path = self.path().into_iter().collect::<StorePath>();
         let trigger = self.get_trigger(self.path().into_iter().collect());
         trigger.this.track();
         trigger.children.track();
+
+        // tracks `this` for all ancestors: i.e., it will track any change that is made
+        // directly to one of its ancestors, but not a change made to a *child* of an ancestor
+        // (which would end up with every subfield tracking its own siblings, because they are
+        // children of its parent)
+        while !full_path.is_empty() {
+            full_path.pop();
+            let inner = self.get_trigger(full_path.clone());
+            inner.this.track();
+        }
     }
 }
 
 impl<Inner, Prev, K, T> KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -151,19 +285,53 @@ where
             .map(|r| r.deref().into_iter().map(|n| (self.key_fn)(n)).collect())
             .unwrap_or_default()
     }
+
+    pub(crate) fn path_at_key(
+        &self,
+        base_path: &StorePath,
+        key: &K,
+    ) -> Option<StorePath> {
+        let keys = self.keys();
+        let keys = keys.as_ref()?;
+        let segment = keys
+            .with_field_keys(
+                base_path.clone(),
+                |keys| (keys.get(key), vec![]),
+                || self.latest_keys(),
+            )
+            .flatten()
+            .map(|(_, idx)| idx)?;
+        let mut path = base_path.clone();
+        path.push(segment);
+        Some(path)
+    }
+}
+
+impl<Inner, Prev, K, T> KeyedSubfield<Inner, Prev, K, T>
+where
+    Self: Clone,
+    T: KeyedIterable,
+    Inner: StoreField<Value = Prev>,
+{
+    /// Keyed access to a keyed subfield of a store.
+    pub fn at_key(&self, key: K) -> AtKeyed<Inner, Prev, K, T> {
+        AtKeyed::new(self.clone(), key)
+    }
 }
 
 /// Gives keyed write access to a value in some collection.
 pub struct KeyedSubfieldWriteGuard<Inner, Prev, K, T, Guard>
 where
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
 {
     inner: KeyedSubfield<Inner, Prev, K, T>,
     guard: Option<Guard>,
+    untracked: bool,
 }
 
 impl<Inner, Prev, K, T, Guard> Deref
@@ -171,7 +339,8 @@ impl<Inner, Prev, K, T, Guard> Deref
 where
     Guard: Deref,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -191,7 +360,8 @@ impl<Inner, Prev, K, T, Guard> DerefMut
 where
     Guard: DerefMut,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -209,12 +379,14 @@ impl<Inner, Prev, K, T, Guard> UntrackableGuard
 where
     Guard: UntrackableGuard,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
 {
     fn untrack(&mut self) {
+        self.untracked = true;
         if let Some(inner) = self.guard.as_mut() {
             inner.untrack();
         }
@@ -225,7 +397,8 @@ impl<Inner, Prev, K, T, Guard> Drop
     for KeyedSubfieldWriteGuard<Inner, Prev, K, T, Guard>
 where
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -239,7 +412,10 @@ where
         // now that the write lock is release, we can get a read lock to refresh this keyed field
         // based on the new value
         self.inner.update_keys();
-        self.inner.notify();
+
+        if !self.untracked {
+            self.inner.notify();
+        }
 
         // reactive updates happen on the next tick
     }
@@ -247,7 +423,7 @@ where
 
 impl<Inner, Prev, K, T> DefinedAt for KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     Inner: StoreField<Value = Prev>,
 {
     fn defined_at(&self) -> Option<&'static Location<'static>> {
@@ -264,7 +440,7 @@ where
 
 impl<Inner, Prev, K, T> IsDisposed for KeyedSubfield<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     Inner: IsDisposed,
 {
     fn is_disposed(&self) -> bool {
@@ -275,7 +451,8 @@ where
 impl<Inner, Prev, K, T> Notify for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -290,7 +467,8 @@ where
 impl<Inner, Prev, K, T> Track for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev> + Track + 'static,
     Prev: 'static,
     T: 'static,
@@ -304,7 +482,8 @@ where
 impl<Inner, Prev, K, T> ReadUntracked for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -319,7 +498,8 @@ where
 impl<Inner, Prev, K, T> Write for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     T: 'static,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
@@ -332,6 +512,7 @@ where
         Some(KeyedSubfieldWriteGuard {
             inner: self.clone(),
             guard: Some(guard),
+            untracked: false,
         })
     }
 
@@ -343,6 +524,7 @@ where
         Some(KeyedSubfieldWriteGuard {
             inner: self.clone(),
             guard: Some(guard),
+            untracked: true,
         })
     }
 }
@@ -351,7 +533,7 @@ where
 #[derive(Debug)]
 pub struct AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
 {
     #[cfg(any(debug_assertions, leptos_debuginfo))]
     defined_at: &'static Location<'static>,
@@ -359,9 +541,20 @@ where
     key: K,
 }
 
+impl<Inner, Prev, K, T> AtKeyed<Inner, Prev, K, T>
+where
+    T: KeyedIterable,
+    K: Clone,
+{
+    /// Key used for keyed collection access.
+    pub fn key(&self) -> K {
+        self.key.clone()
+    }
+}
+
 impl<Inner, Prev, K, T> Clone for AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
     K: Debug + Clone,
 {
@@ -377,7 +570,7 @@ where
 
 impl<Inner, Prev, K, T> Copy for AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     KeyedSubfield<Inner, Prev, K, T>: Copy,
     K: Debug + Copy,
 {
@@ -385,7 +578,7 @@ where
 
 impl<Inner, Prev, K, T> AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
 {
     /// Provides access to the item in the inner collection at this key.
     #[track_caller]
@@ -399,26 +592,96 @@ where
     }
 }
 
-impl<Inner, Prev, K, T> StoreField for AtKeyed<Inner, Prev, K, T>
+impl<Inner, Prev, K, T> AtKeyed<Inner, Prev, K, T>
 where
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
-    T: IndexMut<usize>,
-    T::Output: Sized,
+    T: KeyedAccess<K>,
+    T::Value: Sized,
 {
-    type Value = T::Output;
+    /// Attempt to resolve the inner index if is still exists.
+    ///
+    /// The key map is only regenerated when the keyed subfield itself is
+    /// written to. A write to one of its *ancestors* (e.g., `parent.update(...)`)
+    /// notifies the subfield but leaves its keys stale, so a cached index may
+    /// now point past the end of the collection, or at a different element.
+    /// To guard against that, the cached index is checked against the current
+    /// collection, and the keys are regenerated if it no longer matches.
+    ///
+    /// This reads from the store, so it must never be called while a write
+    /// guard on the store is held.
+    fn resolve_index(&self) -> Option<usize> {
+        let inner_path: StorePath = self.inner.path().into_iter().collect();
+        let keys = self.inner.keys()?;
+        let lookup = || {
+            keys.with_field_keys(
+                inner_path.clone(),
+                |keys| (keys.get(&self.key), vec![]),
+                || self.inner.latest_keys(),
+            )
+            .flatten()
+            .map(|(_, idx)| idx)
+        };
+
+        let index = lookup();
+        if self.index_is_current(index) {
+            return index;
+        }
+
+        // the cached keys are out of date: regenerate them and try again
+        self.inner.update_keys();
+        lookup()
+    }
+
+    /// Checks whether `index` (or its absence) matches the current state of
+    /// the collection, by comparing the key of the element at that position.
+    fn index_is_current(&self, index: Option<usize>) -> bool {
+        let Some(reader) = self.inner.reader() else {
+            // nothing to compare against; nothing we can do
+            return true;
+        };
+        let key_fn = self.inner.key_fn;
+        match index {
+            Some(index) => reader
+                .deref()
+                .into_iter()
+                .nth(index)
+                .is_some_and(|item| key_fn(item) == self.key),
+            // the key was not found: this is only current if it is
+            // genuinely absent from the collection
+            None => !reader
+                .deref()
+                .into_iter()
+                .any(|item| key_fn(item) == self.key),
+        }
+    }
+}
+
+impl<Inner, Prev, K, T> StoreField for AtKeyed<Inner, Prev, K, T>
+where
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    KeyedSubfield<Inner, Prev, K, T>: Clone,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
+    Inner: StoreField<Value = Prev>,
+    Prev: 'static,
+    T: KeyedAccess<K>,
+    T::Value: Sized,
+{
+    type Value = T::Value;
     type Reader = MappedMutArc<
         <KeyedSubfield<Inner, Prev, K, T> as StoreField>::Reader,
-        T::Output,
+        T::Value,
     >;
     type Writer = WriteGuard<
-        ArcTrigger,
+        Vec<ArcTrigger>,
         MappedMutArc<
             <KeyedSubfield<Inner, Prev, K, T> as StoreField>::Writer,
-            T::Output,
+            T::Value,
         >,
     >;
 
@@ -431,7 +694,7 @@ where
         let this = keys
             .with_field_keys(
                 inner.clone(),
-                |keys| keys.get(&self.key),
+                |keys| (keys.get(&self.key), vec![]),
                 || self.inner.latest_keys(),
             )
             .flatten()
@@ -439,55 +702,70 @@ where
         inner.into_iter().chain(this)
     }
 
-    fn get_trigger(&self, path: StorePath) -> StoreFieldTrigger {
-        self.inner.get_trigger(path)
-    }
-
-    fn reader(&self) -> Option<Self::Reader> {
-        let inner = self.inner.reader()?;
-
-        let inner_path = self.inner.path().into_iter().collect();
-        let keys = self.inner.keys()?;
-        let index = keys
-            .with_field_keys(
-                inner_path,
-                |keys| keys.get(&self.key),
-                || self.inner.latest_keys(),
-            )
-            .flatten()
-            .map(|(_, idx)| idx)?;
-
-        Some(MappedMutArc::new(
-            inner,
-            move |n| &n[index],
-            move |n| &mut n[index],
-        ))
-    }
-
-    fn writer(&self) -> Option<Self::Writer> {
-        let inner = self.inner.writer()?;
-        let trigger = self.get_trigger(self.path().into_iter().collect());
-
-        let inner_path = self.inner.path().into_iter().collect::<StorePath>();
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        let inner =
+            self.inner.path_unkeyed().into_iter().collect::<StorePath>();
         let keys = self
             .inner
             .keys()
             .expect("using keys on a store with no keys");
-        let index = keys
+        let this = keys
             .with_field_keys(
-                inner_path.clone(),
-                |keys| keys.get(&self.key),
+                inner.clone(),
+                |keys| (keys.get(&self.key), vec![]),
                 || self.inner.latest_keys(),
             )
             .flatten()
-            .map(|(_, idx)| idx)?;
+            .map(|(_, idx)| StorePathSegment(idx));
+        inner.into_iter().chain(this)
+    }
 
+    fn get_trigger(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner.get_trigger(path)
+    }
+
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner.get_trigger_unkeyed(path)
+    }
+
+    fn reader(&self) -> Option<Self::Reader> {
+        // resolve the index before taking the read guard: resolving may
+        // regenerate keys, which reads the store itself
+        let index = self.resolve_index()?;
+        let inner = self.inner.reader()?;
+        Some(MappedMutArc::new(
+            inner,
+            {
+                let key = self.key.clone();
+                move |n| n.keyed(index, &key)
+            },
+            {
+                let key = self.key.clone();
+                move |n| n.keyed_mut(index, &key)
+            },
+        ))
+    }
+
+    fn writer(&self) -> Option<Self::Writer> {
+        // resolve the index (and the triggers, which depend on the current
+        // keys) *before* taking the write guard: resolving reads the store,
+        // which would deadlock against our own write lock
+        let index = self.resolve_index()?;
+        let triggers = self.triggers_for_current_path();
+        let mut inner = self.inner.writer()?;
+        inner.untrack();
         Some(WriteGuard::new(
-            trigger.children,
+            triggers,
             MappedMutArc::new(
                 inner,
-                move |n| &n[index],
-                move |n| &mut n[index],
+                {
+                    let key = self.key.clone();
+                    move |n| n.keyed(index, &key)
+                },
+                {
+                    let key = self.key.clone();
+                    move |n| n.keyed_mut(index, &key)
+                },
             ),
         ))
     }
@@ -496,11 +774,28 @@ where
     fn keys(&self) -> Option<KeyMap> {
         self.inner.keys()
     }
+
+    fn track_field(&self) {
+        let mut full_path = self.path().into_iter().collect::<StorePath>();
+        let trigger = self.get_trigger(self.path().into_iter().collect());
+        trigger.this.track();
+        trigger.children.track();
+
+        // tracks `this` for all ancestors: i.e., it will track any change that is made
+        // directly to one of its ancestors, but not a change made to a *child* of an ancestor
+        // (which would end up with every subfield tracking its own siblings, because they are
+        // children of its parent)
+        while !full_path.is_empty() {
+            full_path.pop();
+            let inner = self.get_trigger(full_path.clone());
+            inner.this.track();
+        }
+    }
 }
 
 impl<Inner, Prev, K, T> DefinedAt for AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
 {
     fn defined_at(&self) -> Option<&'static Location<'static>> {
         #[cfg(any(debug_assertions, leptos_debuginfo))]
@@ -516,7 +811,7 @@ where
 
 impl<Inner, Prev, K, T> IsDisposed for AtKeyed<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
     Inner: IsDisposed,
 {
     fn is_disposed(&self) -> bool {
@@ -526,13 +821,14 @@ where
 
 impl<Inner, Prev, K, T> Notify for AtKeyed<Inner, Prev, K, T>
 where
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
-    T: IndexMut<usize>,
-    T::Output: Sized,
+    T: KeyedAccess<K>,
+    T::Value: Sized,
 {
     fn notify(&self) {
         let trigger = self.get_trigger(self.path().into_iter().collect());
@@ -543,13 +839,14 @@ where
 
 impl<Inner, Prev, K, T> Track for AtKeyed<Inner, Prev, K, T>
 where
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
-    T: IndexMut<usize>,
-    T::Output: Sized,
+    T: KeyedAccess<K>,
+    T::Value: Sized,
 {
     fn track(&self) {
         self.track_field();
@@ -558,13 +855,14 @@ where
 
 impl<Inner, Prev, K, T> ReadUntracked for AtKeyed<Inner, Prev, K, T>
 where
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
-    T: IndexMut<usize>,
-    T::Output: Sized,
+    T: KeyedAccess<K>,
+    T::Value: Sized,
 {
     type Value = <Self as StoreField>::Reader;
 
@@ -575,15 +873,16 @@ where
 
 impl<Inner, Prev, K, T> Write for AtKeyed<Inner, Prev, K, T>
 where
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
-    T: IndexMut<usize>,
-    T::Output: Sized + 'static,
+    T: KeyedAccess<K>,
+    T::Value: Sized + 'static,
 {
-    type Value = T::Output;
+    type Value = T::Value;
 
     fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
         self.writer()
@@ -602,7 +901,8 @@ where
 impl<Inner, Prev, K, T> KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: StoreField<Value = Prev>,
     Prev: 'static,
     K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
@@ -622,9 +922,7 @@ where
         let latest = self.latest_keys();
         keys.with_field_keys(
             inner_path,
-            |keys| {
-                keys.update(latest);
-            },
+            |keys| ((), keys.update(latest)),
             || self.latest_keys(),
         );
     }
@@ -633,12 +931,13 @@ where
 impl<Inner, Prev, K, T> IntoIterator for KeyedSubfield<Inner, Prev, K, T>
 where
     Self: Clone,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
     Inner: Clone + StoreField<Value = Prev> + 'static,
     Prev: 'static,
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
-    T: IndexMut<usize> + 'static,
-    T::Output: Sized,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    T: KeyedAccess<K> + 'static,
+    T::Value: Sized,
 {
     type Item = AtKeyed<Inner, Prev, K, T>;
     type IntoIter = StoreFieldKeyedIter<Inner, Prev, K, T>;
@@ -668,8 +967,7 @@ where
 /// An iterator over a [`KeyedSubfield`].
 pub struct StoreFieldKeyedIter<Inner, Prev, K, T>
 where
-    for<'a> &'a T: IntoIterator,
-    T: IndexMut<usize>,
+    T: KeyedIterable + KeyedAccess<K>,
 {
     inner: KeyedSubfield<Inner, Prev, K, T>,
     keys: VecDeque<K>,
@@ -677,10 +975,9 @@ where
 
 impl<Inner, Prev, K, T> Iterator for StoreFieldKeyedIter<Inner, Prev, K, T>
 where
+    T: KeyedIterable,
     Inner: StoreField<Value = Prev> + Clone + 'static,
-    T: IndexMut<usize> + 'static,
-    T::Output: Sized + 'static,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedAccess<K> + 'static,
 {
     type Item = AtKeyed<Inner, Prev, K, T>;
 
@@ -694,14 +991,640 @@ where
 impl<Inner, Prev, K, T> DoubleEndedIterator
     for StoreFieldKeyedIter<Inner, Prev, K, T>
 where
+    T: KeyedIterable,
     Inner: StoreField<Value = Prev> + Clone + 'static,
-    T: IndexMut<usize> + 'static,
-    T::Output: Sized + 'static,
-    for<'a> &'a T: IntoIterator,
+    T: KeyedAccess<K> + 'static,
+    T::Value: Sized + 'static,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.keys
             .pop_back()
             .map(|key| AtKeyed::new(self.inner.clone(), key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{self as reactive_stores, AtKeyed, Store, tests::tick};
+    use reactive_graph::{
+        effect::Effect,
+        traits::{Get, GetUntracked, ReadUntracked, Set, Track, Write},
+    };
+    use reactive_stores::Patch;
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashMap},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug, Store, Default, Patch)]
+    struct TodoVec {
+        #[store(key: usize = |todo| todo.id)]
+        todos: Vec<Todo>,
+    }
+    impl TodoVec {
+        fn test_data() -> Self {
+            Self {
+                todos: vec![
+                    Todo {
+                        id: 10,
+                        label: "A".to_string(),
+                    },
+                    Todo {
+                        id: 11,
+                        label: "B".to_string(),
+                    },
+                    Todo {
+                        id: 12,
+                        label: "C".to_string(),
+                    },
+                ],
+            }
+        }
+    }
+
+    #[derive(Debug, Store, Default)]
+    struct TodoBTreeMap {
+        #[store(key: usize = |(key, _)| *key)]
+        todos: BTreeMap<usize, Todo>,
+    }
+    impl TodoBTreeMap {
+        fn test_data() -> Self {
+            Self {
+                todos: [
+                    Todo {
+                        id: 10,
+                        label: "A".to_string(),
+                    },
+                    Todo {
+                        id: 11,
+                        label: "B".to_string(),
+                    },
+                    Todo {
+                        id: 12,
+                        label: "C".to_string(),
+                    },
+                ]
+                .into_iter()
+                .map(|todo| (todo.id, todo))
+                .collect(),
+            }
+        }
+    }
+
+    #[derive(Debug, Store, Default)]
+    struct TodoHashMap {
+        #[store(key: String = |(key, _)| key.clone())]
+        todos: HashMap<String, Todo>,
+    }
+    impl TodoHashMap {
+        fn test_data() -> Self {
+            Self {
+                todos: [
+                    Todo {
+                        id: 10,
+                        label: "A".to_string(),
+                    },
+                    Todo {
+                        id: 11,
+                        label: "B".to_string(),
+                    },
+                    Todo {
+                        id: 12,
+                        label: "C".to_string(),
+                    },
+                ]
+                .into_iter()
+                .map(|todo| (todo.label.clone(), todo))
+                .collect(),
+            }
+        }
+    }
+
+    #[derive(
+        Debug, Store, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Patch,
+    )]
+    struct Todo {
+        id: usize,
+        label: String,
+    }
+
+    impl Todo {
+        pub fn new(id: usize, label: impl ToString) -> Self {
+            Self {
+                id,
+                label: label.to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_fields_can_be_moved() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let store = Store::new(TodoVec::test_data());
+        assert_eq!(store.read_untracked().todos.len(), 3);
+
+        // create an effect to read from each keyed field
+        let a_count = Arc::new(AtomicUsize::new(0));
+        let b_count = Arc::new(AtomicUsize::new(0));
+        let c_count = Arc::new(AtomicUsize::new(0));
+
+        let a = AtKeyed::new(store.todos(), 10);
+        let b = AtKeyed::new(store.todos(), 11);
+        let c = AtKeyed::new(store.todos(), 12);
+
+        Effect::new_sync({
+            let a_count = Arc::clone(&a_count);
+            move || {
+                a.track();
+                a_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let b_count = Arc::clone(&b_count);
+            move || {
+                b.track();
+                b_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let c_count = Arc::clone(&c_count);
+            move || {
+                c.track();
+                c_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // writing at a key doesn't notify siblings
+        *a.label().write() = "Foo".into();
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 2);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // the keys can be reorganized
+        store.todos().write().swap(0, 2);
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(10, "Foo")]
+        );
+
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 3);
+        assert_eq!(b_count.load(Ordering::Relaxed), 2);
+        assert_eq!(c_count.load(Ordering::Relaxed), 2);
+
+        // and after we move the keys around, they still update the moved items
+        a.label().set("Bar".into());
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(10, "Bar")]
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 4);
+        assert_eq!(b_count.load(Ordering::Relaxed), 2);
+        assert_eq!(c_count.load(Ordering::Relaxed), 2);
+
+        // we can remove a key and add a new one
+        store.todos().write().pop();
+        store.todos().write().push(Todo::new(13, "New"));
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(13, "New")]
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 5);
+        assert_eq!(b_count.load(Ordering::Relaxed), 3);
+        assert_eq!(c_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn untracked_write_on_keyed_subfield_shouldnt_notify() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let store = Store::new(TodoVec::test_data());
+        assert_eq!(store.read_untracked().todos.len(), 3);
+
+        // create an effect to read from the keyed subfield
+        let todos_count = Arc::new(AtomicUsize::new(0));
+        Effect::new_sync({
+            let todos_count = Arc::clone(&todos_count);
+            move || {
+                store.todos().track();
+                todos_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(todos_count.load(Ordering::Relaxed), 1);
+
+        // writing to keyed subfield notifies the iterator
+        store.todos().write().push(Todo {
+            id: 13,
+            label: "D".into(),
+        });
+        tick().await;
+        assert_eq!(todos_count.load(Ordering::Relaxed), 2);
+
+        // but an untracked write doesn't
+        store.todos().write_untracked().push(Todo {
+            id: 14,
+            label: "E".into(),
+        });
+        tick().await;
+        assert_eq!(todos_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn btree_keyed_fields_can_be_moved() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let store = Store::new(TodoBTreeMap::test_data());
+        assert_eq!(store.read_untracked().todos.len(), 3);
+
+        // create an effect to read from each keyed field
+        let a_count = Arc::new(AtomicUsize::new(0));
+        let b_count = Arc::new(AtomicUsize::new(0));
+        let c_count = Arc::new(AtomicUsize::new(0));
+
+        let a = AtKeyed::new(store.todos(), 10);
+        let b = AtKeyed::new(store.todos(), 11);
+        let c = AtKeyed::new(store.todos(), 12);
+
+        Effect::new_sync({
+            let a_count = Arc::clone(&a_count);
+            move || {
+                a.track();
+                a_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let b_count = Arc::clone(&b_count);
+            move || {
+                b.track();
+                b_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let c_count = Arc::clone(&c_count);
+            move || {
+                c.track();
+                c_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // writing at a key doesn't notify siblings
+        *a.label().write() = "Foo".into();
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 2);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<Vec<_>>(),
+            vec![Todo::new(10, "Foo"), Todo::new(11, "B"), Todo::new(12, "C"),]
+        );
+
+        a.label().set("Bar".into());
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<Vec<_>>(),
+            vec![Todo::new(10, "Bar"), Todo::new(11, "B"), Todo::new(12, "C"),]
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 3);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // we can remove a key and add a new one
+        store.todos().write().remove(&12);
+        store.todos().write().insert(13, Todo::new(13, "New"));
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<Vec<_>>(),
+            vec![
+                Todo::new(10, "Bar"),
+                Todo::new(11, "B"),
+                Todo::new(13, "New")
+            ]
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 4);
+        assert_eq!(b_count.load(Ordering::Relaxed), 2);
+        assert_eq!(c_count.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            after.keys().copied().collect::<BTreeSet<usize>>(),
+            BTreeSet::from([10, 11, 13])
+        );
+
+        let at_existing_key = AtKeyed::new(store.todos(), 13);
+        let existing = at_existing_key.try_get();
+        assert!(existing.is_some());
+        assert_eq!(existing, Some(Todo::new(13, "New")));
+
+        let at_faulty_key = AtKeyed::new(store.todos(), 999);
+        let missing = at_faulty_key.try_get();
+        assert!(missing.is_none(), "faulty key should return none.")
+    }
+
+    #[tokio::test]
+    async fn hashmap_keyed_fields_can_be_moved() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let store = Store::new(TodoHashMap::test_data());
+        assert_eq!(store.read_untracked().todos.len(), 3);
+
+        // create an effect to read from each keyed field
+        let a_count = Arc::new(AtomicUsize::new(0));
+        let b_count = Arc::new(AtomicUsize::new(0));
+        let c_count = Arc::new(AtomicUsize::new(0));
+
+        let a = AtKeyed::new(store.todos(), "A".to_string());
+        let b = AtKeyed::new(store.todos(), "B".to_string());
+        let c = AtKeyed::new(store.todos(), "C".to_string());
+
+        Effect::new_sync({
+            let a_count = Arc::clone(&a_count);
+            let a = a.clone();
+            move || {
+                a.track();
+                a_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let b_count = Arc::clone(&b_count);
+            move || {
+                b.track();
+                b_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let c_count = Arc::clone(&c_count);
+            move || {
+                c.track();
+                c_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // writing at a key doesn't notify siblings
+        *a.clone().label().write() = "Foo".to_string();
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 2);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                Todo::new(10, "Foo"),
+                Todo::new(11, "B"),
+                Todo::new(12, "C"),
+            ])
+        );
+
+        a.clone().label().set("Bar".into());
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                Todo::new(10, "Bar"),
+                Todo::new(11, "B"),
+                Todo::new(12, "C")
+            ]),
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 3);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // we can remove a key and add a new one
+        store.todos().write().remove(&"C".to_string());
+        store
+            .todos()
+            .write()
+            .insert("New".to_string(), Todo::new(13, "New"));
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after.values().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                Todo::new(10, "Bar"),
+                Todo::new(11, "B"),
+                Todo::new(13, "New"),
+            ])
+        );
+        tick().await;
+        assert_eq!(a_count.load(Ordering::Relaxed), 4);
+        assert_eq!(b_count.load(Ordering::Relaxed), 2);
+        assert_eq!(c_count.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            after.keys().cloned().collect::<BTreeSet<String>>(),
+            BTreeSet::from([
+                "A".to_string(),
+                "B".to_string(),
+                "New".to_string()
+            ])
+        );
+
+        let at_existing_key = AtKeyed::new(store.todos(), "New".to_string());
+        let existing = at_existing_key.try_get();
+        assert!(existing.is_some());
+        assert_eq!(existing, Some(Todo::new(13, "New")));
+
+        let at_faulty_key = AtKeyed::new(store.todos(), "faulty".to_string());
+        let missing = at_faulty_key.try_get();
+        assert!(missing.is_none(), "faulty key should return none.")
+    }
+
+    #[test]
+    fn non_usize_keys_work_for_vec() {
+        #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+        struct MyIdType(u32);
+
+        #[derive(Debug, Store)]
+        struct Item {
+            id: MyIdType,
+            _value: String,
+        }
+
+        #[derive(Debug, Store)]
+        struct MyStore {
+            #[store(key: MyIdType = |item| item.id.clone())]
+            items: Vec<Item>,
+        }
+
+        let store = Store::new(MyStore { items: Vec::new() });
+
+        let _fields = store.items().into_iter();
+    }
+
+    #[test]
+    fn nested_keyed_subfields_dont_deadlock_on_first_iter() {
+        _ = any_spawner::Executor::init_tokio();
+
+        // Regression test for a panic/deadlock that occurred when a `For`
+        // over a keyed subfield was nested inside another `For` over a
+        // keyed subfield. Iterating the inner subfield's `KeyedSubfield`
+        // would call `update_keys`, which, while holding a write lock on
+        // the global `KeyMap`, would initialize its entry by calling
+        // `latest_keys()`. That traversed back through the parent
+        // `AtKeyed::reader` -> `resolve_index` -> `with_field_keys`,
+        // attempting to re-acquire the same write lock and aborting.
+        use crate::Field;
+
+        #[derive(Debug, Store, Clone)]
+        struct Part {
+            id: usize,
+            #[store(key: usize = |c| c.id)]
+            chapters: Vec<Chapter>,
+        }
+
+        #[derive(Debug, Store, Clone)]
+        struct Chapter {
+            id: usize,
+        }
+
+        #[derive(Debug, Store)]
+        struct Structure {
+            #[store(key: usize = |p| p.id)]
+            parts: Vec<Part>,
+        }
+
+        let store = Store::new(Structure {
+            parts: vec![Part {
+                id: 1,
+                chapters: vec![Chapter { id: 10 }],
+            }],
+        });
+
+        // Mimic the behavior of nested `<For>` components: iterate the
+        // outer keyed subfield, take a `Field<Part>` for each item, and
+        // iterate its inner keyed subfield. Doing so on a freshly
+        // constructed store ensures both the outer and the inner entries
+        // need to be initialized, which is the case that triggered the
+        // re-entrant write lock.
+        for at_part in store.parts() {
+            let part: Field<Part> = at_part.into();
+            let _: Vec<_> = part.chapters().into_iter().collect();
+        }
+    }
+
+    #[tokio::test]
+    async fn patching_keyed_field_only_notifies_changed_keys() {
+        _ = any_spawner::Executor::init_tokio();
+
+        let store = Store::new(TodoVec::test_data());
+        assert_eq!(store.read_untracked().todos.len(), 3);
+
+        // create an effect to read from each keyed field
+        let whole_count = Arc::new(AtomicUsize::new(0));
+        let a_count = Arc::new(AtomicUsize::new(0));
+        let b_count = Arc::new(AtomicUsize::new(0));
+        let c_count = Arc::new(AtomicUsize::new(0));
+
+        let whole = store.todos();
+        let a = AtKeyed::new(store.todos(), 10);
+        let b = AtKeyed::new(store.todos(), 11);
+        let c = AtKeyed::new(store.todos(), 12);
+
+        Effect::new_sync({
+            let whole_count = Arc::clone(&whole_count);
+            move || {
+                whole.track();
+                whole_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let a_count = Arc::clone(&a_count);
+            move || {
+                a.track();
+                a_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let b_count = Arc::clone(&b_count);
+            move || {
+                b.track();
+                b_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Effect::new_sync({
+            let c_count = Arc::clone(&c_count);
+            move || {
+                c.track();
+                c_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tick().await;
+        assert_eq!(whole_count.load(Ordering::Relaxed), 1);
+        assert_eq!(a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // patching only notifies changed keys
+        let mut new_data = store.todos().get_untracked();
+        new_data.swap(0, 2);
+        store.todos().patch(new_data.clone());
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(10, "A")]
+        );
+
+        tick().await;
+        assert_eq!(whole_count.load(Ordering::Relaxed), 2);
+        assert_eq!(a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // and after we move the keys around, they still update the moved items
+        a.label().set("Bar".into());
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(10, "Bar")]
+        );
+        tick().await;
+        assert_eq!(whole_count.load(Ordering::Relaxed), 3);
+        assert_eq!(a_count.load(Ordering::Relaxed), 2);
+        assert_eq!(b_count.load(Ordering::Relaxed), 1);
+        assert_eq!(c_count.load(Ordering::Relaxed), 1);
+
+        // regular writes to the collection notify all keyed children
+        store.todos().write().pop();
+        store.todos().write().push(Todo::new(13, "New"));
+        let after = store.todos().get_untracked();
+        assert_eq!(
+            after,
+            vec![Todo::new(12, "C"), Todo::new(11, "B"), Todo::new(13, "New")]
+        );
+        tick().await;
+        assert_eq!(whole_count.load(Ordering::Relaxed), 4);
+        assert_eq!(a_count.load(Ordering::Relaxed), 3);
+        assert_eq!(b_count.load(Ordering::Relaxed), 2);
+        assert_eq!(c_count.load(Ordering::Relaxed), 2);
     }
 }

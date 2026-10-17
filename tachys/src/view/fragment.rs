@@ -2,6 +2,7 @@ use super::{
     any_view::{AnyView, IntoAny},
     iterators::StaticVec,
 };
+use crate::html::element::HtmlElement;
 
 /// A typed-erased collection of different views.
 pub struct Fragment {
@@ -40,6 +41,21 @@ impl Fragment {
         Self {
             nodes: nodes.into(),
         }
+    }
+}
+
+impl<E, At, Ch> IntoFragment for HtmlElement<E, At, Ch>
+where
+    HtmlElement<E, At, Ch>: IntoAny,
+{
+    fn into_fragment(self) -> Fragment {
+        Fragment::new(vec![self.into_any()])
+    }
+}
+
+impl IntoFragment for AnyView {
+    fn into_fragment(self) -> Fragment {
+        Fragment::new(vec![self])
     }
 }
 
@@ -106,10 +122,18 @@ tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
 tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
 tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S);
 tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T);
-tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U);
-tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V);
-tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W);
-tuples!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X);
+tuples!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U
+);
+tuples!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V
+);
+tuples!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W
+);
+tuples!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X
+);
 tuples!(
     A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y
 );

@@ -1,0 +1,71 @@
+experimental = ["setup-scripts"]
+
+# For tests that need to run one at a time to avoid resource contention from
+# parallel execution.
+[test-groups]
+serial-integration = { max-threads = 1 }
+
+# The built-in `fn build_test_service` in the test runs a single instance of
+# `cargo leptos build` guaranteed with `std::sync::Once`.  However,
+# `cargo-nexttest` does not have the ability to group tests under the same
+# process to emulate what `cargo test` does, thus resulting in competing
+# `wasm-bindgen` executions that will clobber each other, breaking the tests.
+# While serializing the tests was done at one point as a quick workaround,
+# using setup-scripts is the better approach.
+#
+# References:
+# - https://github.com/nextest-rs/nextest/issues/27
+# - https://github.com/nextest-rs/nextest/issues/209
+#
+# [[profile.default.overrides]]
+# filter = "binary_id(leptos_axum::axum_integration)"
+# test-group = "serial-integration"
+
+[scripts.setup.axum_integration_service_mode_frontend]
+command = {
+    command-line = [
+        "cargo",
+        "leptos",
+        "--manifest-path",
+        "integrations/axum/tests/service_mode/Cargo.toml",
+        "build",
+        "--frontend-only",
+    ],
+    env = {
+        LEPTOS_OUTPUT_NAME = "service_mode",
+    },
+}
+
+[scripts.setup.axum_integration_service_mode_server]
+# As of writing of this comment/commit, `cargo leptos build --server-only`
+# **will** delete contents of `LEPTOS_SITE_ROOT` unconditionally, which
+# incidentally breaks the ability to embed or otherwise keep the frontend
+# around for the testing to happen.  For now just workaround the issue by
+# issuing the roughly equivalent `cargo` command that it would have execute.
+command = {
+    command-line = [
+        "cargo",
+        "build",
+        "--manifest-path",
+        "integrations/axum/tests/service_mode/Cargo.toml",
+        "--package",
+        "service_mode",
+        "--bin",
+        "service_mode",
+        "--no-default-features",
+        "--features=ssr",
+    ],
+    env = {
+        LEPTOS_OUTPUT_NAME = "service_mode",
+        LEPTOS_SITE_ROOT = "target/site",
+        LEPTOS_SITE_PKG_DIR = "pkg",
+        RUSTFLAGS = "--cfg erase_components",
+    },
+}
+
+[[profile.default.scripts]]
+filter = "binary_id(leptos_axum::axum_integration)"
+setup = [
+    "axum_integration_service_mode_frontend",
+    "axum_integration_service_mode_server",
+]

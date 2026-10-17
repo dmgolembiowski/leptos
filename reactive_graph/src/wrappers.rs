@@ -10,8 +10,9 @@ pub mod read {
             SyncStorage,
         },
         signal::{
+            ArcMappedSignal, ArcReadSignal, ArcRwSignal, MappedSignal,
+            ReadSignal, RwSignal,
             guards::{Mapped, Plain, ReadGuard},
-            ArcReadSignal, ArcRwSignal, ReadSignal, RwSignal,
         },
         traits::{
             DefinedAt, Dispose, Get, Read, ReadUntracked, ReadValue, Track,
@@ -218,6 +219,24 @@ pub mod read {
         }
     }
 
+    impl<T> ArcSignal<T, LocalStorage>
+    where
+        T: 'static,
+    {
+        /// Wraps a derived signal. Works like [`Signal::derive`] but uses [`LocalStorage`].
+        #[track_caller]
+        pub fn derive_local(derived_signal: impl Fn() -> T + 'static) -> Self {
+            Signal::derive_local(derived_signal).into()
+        }
+
+        /// Moves a static, nonreactive value into a signal, backed by [`ArcStoredValue`].
+        /// Works like [`Signal::stored`] but uses [`LocalStorage`].
+        #[track_caller]
+        pub fn stored_local(value: T) -> Self {
+            Signal::stored_local(value).into()
+        }
+    }
+
     impl<T> Default for ArcSignal<T, SyncStorage>
     where
         T: Default + Send + Sync + 'static,
@@ -238,11 +257,39 @@ pub mod read {
         }
     }
 
+    impl<T, S> From<ReadSignal<T, S>> for ArcSignal<T, S>
+    where
+        S: Storage<ArcReadSignal<T>> + Storage<T>,
+    {
+        #[track_caller]
+        fn from(value: ReadSignal<T, S>) -> Self {
+            Self {
+                inner: SignalTypes::ReadSignal(value.into()),
+                #[cfg(any(debug_assertions, leptos_debuginfo))]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
     impl<T: Send + Sync> From<ArcRwSignal<T>> for ArcSignal<T, SyncStorage> {
         #[track_caller]
         fn from(value: ArcRwSignal<T>) -> Self {
             Self {
                 inner: SignalTypes::ReadSignal(value.read_only()),
+                #[cfg(any(debug_assertions, leptos_debuginfo))]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
+    impl<T, S> From<RwSignal<T, S>> for ArcSignal<T, S>
+    where
+        S: Storage<ArcRwSignal<T>> + Storage<ArcReadSignal<T>> + Storage<T>,
+    {
+        #[track_caller]
+        fn from(value: RwSignal<T, S>) -> Self {
+            Self {
+                inner: SignalTypes::ReadSignal(value.read_only().into()),
                 #[cfg(any(debug_assertions, leptos_debuginfo))]
                 defined_at: std::panic::Location::caller(),
             }
@@ -257,6 +304,36 @@ pub mod read {
         fn from(value: ArcMemo<T, S>) -> Self {
             Self {
                 inner: SignalTypes::Memo(value),
+                #[cfg(any(debug_assertions, leptos_debuginfo))]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
+    impl<T, S> From<Memo<T, S>> for ArcSignal<T, S>
+    where
+        S: Storage<ArcMemo<T, S>> + Storage<T>,
+    {
+        #[track_caller]
+        fn from(value: Memo<T, S>) -> Self {
+            Self {
+                inner: SignalTypes::Memo(value.into()),
+                #[cfg(any(debug_assertions, leptos_debuginfo))]
+                defined_at: std::panic::Location::caller(),
+            }
+        }
+    }
+
+    impl<S> From<&'static str> for ArcSignal<String, S>
+    where
+        S: Storage<&'static str> + Storage<String>,
+    {
+        #[track_caller]
+        fn from(value: &'static str) -> Self {
+            Self {
+                inner: SignalTypes::Stored(ArcStoredValue::new(
+                    value.to_string(),
+                )),
                 #[cfg(any(debug_assertions, leptos_debuginfo))]
                 defined_at: std::panic::Location::caller(),
             }
@@ -789,6 +866,16 @@ pub mod read {
         }
     }
 
+    impl<T> From<MappedSignal<T>> for Signal<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        #[track_caller]
+        fn from(value: MappedSignal<T>) -> Self {
+            Self::derive(move || value.get())
+        }
+    }
+
     impl<T> From<RwSignal<T, LocalStorage>> for Signal<T, LocalStorage>
     where
         T: 'static,
@@ -818,6 +905,16 @@ pub mod read {
                 #[cfg(any(debug_assertions, leptos_debuginfo))]
                 defined_at: std::panic::Location::caller(),
             }
+        }
+    }
+
+    impl<T> From<ArcMappedSignal<T>> for Signal<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        #[track_caller]
+        fn from(value: ArcMappedSignal<T>) -> Self {
+            MappedSignal::from(value).into()
         }
     }
 
@@ -968,6 +1065,13 @@ pub mod read {
         }
     }
 
+    impl From<Signal<&'static str, LocalStorage>> for Signal<String, LocalStorage> {
+        #[track_caller]
+        fn from(value: Signal<&'static str, LocalStorage>) -> Self {
+            Signal::derive_local(move || value.read().to_string())
+        }
+    }
+
     impl From<Signal<&'static str>> for Signal<String, LocalStorage> {
         #[track_caller]
         fn from(value: Signal<&'static str>) -> Self {
@@ -996,12 +1100,192 @@ pub mod read {
         }
     }
 
+    impl From<Signal<Option<&'static str>, LocalStorage>>
+        for Signal<Option<String>, LocalStorage>
+    {
+        #[track_caller]
+        fn from(value: Signal<Option<&'static str>, LocalStorage>) -> Self {
+            Signal::derive_local(move || value.read().map(str::to_string))
+        }
+    }
+
     impl From<Signal<Option<&'static str>>>
         for Signal<Option<String>, LocalStorage>
     {
         #[track_caller]
         fn from(value: Signal<Option<&'static str>>) -> Self {
             Signal::derive_local(move || value.read().map(str::to_string))
+        }
+    }
+
+    #[doc(hidden)]
+    pub struct __IntoReactiveValueMarkerSignalFromReactiveClosure;
+    #[doc(hidden)]
+    pub struct __IntoReactiveValueMarkerSignalStrOutputToString;
+    #[doc(hidden)]
+    pub struct __IntoReactiveValueMarkerOptionalSignalFromReactiveClosureAlways;
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            Signal<T, SyncStorage>,
+            __IntoReactiveValueMarkerSignalFromReactiveClosure,
+        > for F
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<T, SyncStorage> {
+            Signal::derive(self)
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            ArcSignal<T, SyncStorage>,
+            __IntoReactiveValueMarkerSignalFromReactiveClosure,
+        > for F
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<T, SyncStorage> {
+            ArcSignal::derive(self)
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            Signal<T, LocalStorage>,
+            __IntoReactiveValueMarkerSignalFromReactiveClosure,
+        > for F
+    where
+        T: 'static,
+        F: Fn() -> T + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<T, LocalStorage> {
+            Signal::derive_local(self)
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            ArcSignal<T, LocalStorage>,
+            __IntoReactiveValueMarkerSignalFromReactiveClosure,
+        > for F
+    where
+        T: 'static,
+        F: Fn() -> T + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<T, LocalStorage> {
+            ArcSignal::derive_local(self)
+        }
+    }
+
+    impl<F>
+        crate::IntoReactiveValue<
+            Signal<String, SyncStorage>,
+            __IntoReactiveValueMarkerSignalStrOutputToString,
+        > for F
+    where
+        F: Fn() -> &'static str + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<String, SyncStorage> {
+            Signal::derive(move || self().to_string())
+        }
+    }
+
+    impl<F>
+        crate::IntoReactiveValue<
+            ArcSignal<String, SyncStorage>,
+            __IntoReactiveValueMarkerSignalStrOutputToString,
+        > for F
+    where
+        F: Fn() -> &'static str + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<String, SyncStorage> {
+            ArcSignal::derive(move || self().to_string())
+        }
+    }
+
+    impl<F>
+        crate::IntoReactiveValue<
+            Signal<String, LocalStorage>,
+            __IntoReactiveValueMarkerSignalStrOutputToString,
+        > for F
+    where
+        F: Fn() -> &'static str + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<String, LocalStorage> {
+            Signal::derive_local(move || self().to_string())
+        }
+    }
+
+    impl<F>
+        crate::IntoReactiveValue<
+            ArcSignal<String, LocalStorage>,
+            __IntoReactiveValueMarkerSignalStrOutputToString,
+        > for F
+    where
+        F: Fn() -> &'static str + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<String, LocalStorage> {
+            ArcSignal::derive_local(move || self().to_string())
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            Signal<Option<T>, SyncStorage>,
+            __IntoReactiveValueMarkerOptionalSignalFromReactiveClosureAlways,
+        > for F
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<Option<T>, SyncStorage> {
+            Signal::derive(move || Some(self()))
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            ArcSignal<Option<T>, SyncStorage>,
+            __IntoReactiveValueMarkerOptionalSignalFromReactiveClosureAlways,
+        > for F
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<Option<T>, SyncStorage> {
+            ArcSignal::derive(move || Some(self()))
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            Signal<Option<T>, LocalStorage>,
+            __IntoReactiveValueMarkerOptionalSignalFromReactiveClosureAlways,
+        > for F
+    where
+        T: 'static,
+        F: Fn() -> T + 'static,
+    {
+        fn into_reactive_value(self) -> Signal<Option<T>, LocalStorage> {
+            Signal::derive_local(move || Some(self()))
+        }
+    }
+
+    impl<T, F>
+        crate::IntoReactiveValue<
+            ArcSignal<Option<T>, LocalStorage>,
+            __IntoReactiveValueMarkerOptionalSignalFromReactiveClosureAlways,
+        > for F
+    where
+        T: 'static,
+        F: Fn() -> T + 'static,
+    {
+        fn into_reactive_value(self) -> ArcSignal<Option<T>, LocalStorage> {
+            ArcSignal::derive_local(move || Some(self()))
         }
     }
 
@@ -1115,7 +1399,7 @@ pub mod read {
     /// ```
     #[derive(Debug, PartialEq, Eq)]
     #[deprecated(
-        since = "0.7.0-rc1",
+        since = "0.7.0-rc3",
         note = "`MaybeSignal<T>` is deprecated in favour of `Signal<T>` which \
                 is `Copy`, now has a more efficient From<T> implementation \
                 and other benefits in 0.7."
@@ -1461,7 +1745,6 @@ pub mod read {
 
     impl<T, S> ReadUntracked for MaybeProp<T, S>
     where
-        T: Clone,
         S: Storage<Option<T>> + Storage<SignalTypes<Option<T>, S>>,
     {
         type Value = ReadGuard<Option<T>, SignalReadGuard<Option<T>, S>>;
@@ -1871,7 +2154,7 @@ pub mod write {
     /// // this function takes any kind of signal setter
     /// fn set_to_4(setter: &SignalSetter<i32>) {
     ///     // ✅ calling the signal sets the value
-    ///     //    can be `setter(4)` on nightly
+    ///     //    this can also be called as `setter(4)`
     ///     setter.set(4);
     /// }
     ///

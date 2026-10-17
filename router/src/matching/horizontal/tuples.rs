@@ -4,7 +4,6 @@ macro_rules! tuples {
     ($first:ident => $($ty:ident),*) => {
         impl<$first, $($ty),*> PossibleRouteMatch for ($first, $($ty,)*)
         where
-            Self: core::fmt::Debug,
             $first: PossibleRouteMatch,
 			$($ty: PossibleRouteMatch),*,
         {
@@ -29,27 +28,28 @@ macro_rules! tuples {
                     let mut r = path;
 
                     let mut p = Vec::new();
-                    let mut m = String::new();
 
-                    if !$first.optional() || nth_field < include_optionals {
+                    if $first.optional() {
+                        nth_field += 1;
+                    }
+                    if !$first.optional() || nth_field <= include_optionals {
                         match $first.test(r) {
                             None => {
                                 return None;
                             },
                             Some(PartialPathMatch { remaining, matched, params }) => {
                                 p.extend(params.into_iter());
-                                m.push_str(matched);
+                                matched_len += matched.len();
                                 r = remaining;
                             },
                         }
                     }
 
-                    matched_len += m.len();
                     $(
                         if $ty.optional() {
                             nth_field += 1;
                         }
-                        if !$ty.optional() || nth_field < include_optionals {
+                        if !$ty.optional() || nth_field <= include_optionals {
                             let PartialPathMatch {
                                 remaining,
                                 matched,

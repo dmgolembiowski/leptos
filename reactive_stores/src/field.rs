@@ -1,8 +1,9 @@
 use crate::{
+    ArcField, ArcStore, AtIndex, AtKeyed, DerefedField, KeyMap, KeyedAccess,
+    KeyedIterable, KeyedSubfield, Store, StoreField, StoreFieldTrigger,
+    Subfield,
     arc_field::{StoreFieldReader, StoreFieldWriter},
     path::{StorePath, StorePathSegment},
-    ArcField, ArcStore, AtIndex, AtKeyed, DerefedField, KeyMap, KeyedSubfield,
-    Store, StoreField, StoreFieldTrigger, Subfield,
 };
 use reactive_graph::{
     owner::{ArenaItem, Storage, SyncStorage},
@@ -59,10 +60,24 @@ where
             .unwrap_or_default()
     }
 
+    fn get_trigger_unkeyed(&self, path: StorePath) -> StoreFieldTrigger {
+        self.inner
+            .try_get_value()
+            .map(|inner| inner.get_trigger_unkeyed(path))
+            .unwrap_or_default()
+    }
+
     fn path(&self) -> impl IntoIterator<Item = StorePathSegment> {
         self.inner
             .try_get_value()
             .map(|inner| inner.path().into_iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    fn path_unkeyed(&self) -> impl IntoIterator<Item = StorePathSegment> {
+        self.inner
+            .try_get_value()
+            .map(|inner| inner.path_unkeyed().into_iter().collect::<Vec<_>>())
             .unwrap_or_default()
     }
 
@@ -129,7 +144,7 @@ where
     T: Send + Sync,
     S: Storage<ArcField<T>>,
     Subfield<Inner, Prev, T>: Clone,
-    Inner: StoreField<Value = Prev> + Send + Sync + 'static,
+    Inner: StoreField<Value = Prev> + IsDisposed + Send + Sync + 'static,
     Prev: 'static,
 {
     #[track_caller]
@@ -144,7 +159,7 @@ where
 
 impl<Inner, T> From<DerefedField<Inner>> for Field<T>
 where
-    Inner: Clone + StoreField + Send + Sync + 'static,
+    Inner: Clone + StoreField + IsDisposed + Send + Sync + 'static,
     Inner::Value: Deref<Target = T> + DerefMut,
     T: Sized + 'static,
 {
@@ -162,8 +177,8 @@ impl<Inner, Prev, S> From<AtIndex<Inner, Prev>> for Field<Prev::Output, S>
 where
     AtIndex<Inner, Prev>: Clone,
     S: Storage<ArcField<Prev::Output>>,
-    Inner: StoreField<Value = Prev> + Send + Sync + 'static,
-    Prev: IndexMut<usize> + Send + Sync + 'static,
+    Inner: StoreField<Value = Prev> + IsDisposed + Send + Sync + 'static,
+    Prev: IndexMut<usize> + crate::len::Len + Send + Sync + 'static,
     Prev::Output: Sized + Send + Sync,
 {
     #[track_caller]
@@ -177,17 +192,18 @@ where
 }
 
 impl<Inner, Prev, K, T, S> From<AtKeyed<Inner, Prev, K, T>>
-    for Field<T::Output, S>
+    for Field<T::Value, S>
 where
-    S: Storage<ArcField<T::Output>>,
+    S: Storage<ArcField<T::Value>>,
     AtKeyed<Inner, Prev, K, T>: Clone,
-    K: Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
+    K: Clone + Debug + Send + Sync + PartialEq + Eq + Hash + 'static,
     KeyedSubfield<Inner, Prev, K, T>: Clone,
-    for<'a> &'a T: IntoIterator,
-    Inner: StoreField<Value = Prev> + Send + Sync + 'static,
+    T: KeyedIterable,
+    for<'a> &'a T: IntoIterator<Item = <T as KeyedIterable>::IterItem<'a>>,
+    Inner: StoreField<Value = Prev> + IsDisposed + Send + Sync + 'static,
     Prev: 'static,
-    T: IndexMut<usize> + 'static,
-    T::Output: Sized,
+    T: KeyedAccess<K> + 'static,
+    T::Value: Sized,
 {
     #[track_caller]
     fn from(value: AtKeyed<Inner, Prev, K, T>) -> Self {
@@ -255,7 +271,10 @@ where
     }
 }
 
-impl<T> Write for Field<T> {
+impl<T, S> Write for Field<T, S>
+where
+    S: Storage<ArcField<T>>,
+{
     type Value = T;
 
     fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
@@ -276,5 +295,32 @@ impl<T> Write for Field<T> {
 impl<T, S> IsDisposed for Field<T, S> {
     fn is_disposed(&self) -> bool {
         self.inner.is_disposed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{self as reactive_stores, Field, Store};
+    use reactive_graph::{
+        owner::{LocalStorage, Owner},
+        traits::{ReadUntracked, Write},
+    };
+
+    #[derive(Default, reactive_stores_macro::Store)]
+    struct State {
+        value: i32,
+    }
+
+    #[test]
+    fn write_is_available_for_non_default_storage() {
+        let owner = Owner::new();
+        owner.set();
+
+        let store: Store<State, LocalStorage> =
+            Store::new_local(State::default());
+        let field: Field<i32, LocalStorage> = store.value().into();
+
+        *field.write() = 7;
+        assert_eq!(*field.read_untracked(), 7);
     }
 }

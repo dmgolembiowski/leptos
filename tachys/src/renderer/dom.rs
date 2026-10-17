@@ -8,11 +8,13 @@ use crate::{
     ok_or_debug, or_debug,
     view::{Mountable, ToTemplate},
 };
-use linear_map::LinearMap;
-use once_cell::unsync::Lazy;
-use rustc_hash::FxHashSet;
-use std::{any::TypeId, borrow::Cow, cell::RefCell};
-use wasm_bindgen::{intern, prelude::Closure, JsCast, JsValue};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{
+    any::TypeId,
+    borrow::Cow,
+    cell::{LazyCell, RefCell},
+};
+use wasm_bindgen::{JsCast, JsValue, intern, prelude::Closure};
 use web_sys::{AddEventListenerOptions, Comment, HtmlTemplateElement};
 
 /// A [`Renderer`](crate::renderer::Renderer) that uses `web-sys` to manipulate DOM elements in the browser.
@@ -21,6 +23,7 @@ pub struct Dom;
 
 thread_local! {
     pub(crate) static GLOBAL_EVENTS: RefCell<FxHashSet<Cow<'static, str>>> = Default::default();
+    pub static TEMPLATE_CACHE: RefCell<FxHashMap<Cow<'static, str>, web_sys::Element>> = Default::default();
 }
 
 pub type Node = web_sys::Node;
@@ -31,6 +34,46 @@ pub type Event = wasm_bindgen::JsValue;
 pub type ClassList = web_sys::DomTokenList;
 pub type CssStyleDeclaration = web_sys::CssStyleDeclaration;
 pub type TemplateElement = web_sys::HtmlTemplateElement;
+
+/// A microtask is a short function which will run after the current task has
+/// completed its work and when there is no other code waiting to be run before
+/// control of the execution context is returned to the browser's event loop.
+///
+/// Microtasks are especially useful for libraries and frameworks that need
+/// to perform final cleanup or other just-before-rendering tasks.
+///
+/// [MDN queueMicrotask](https://developer.mozilla.org/en-US/docs/Web/API/queueMicrotask)
+pub fn queue_microtask(task: impl FnOnce() + 'static) {
+    use js_sys::{Function, Reflect};
+
+    let task = Closure::once_into_js(task);
+    let window = window();
+    let queue_microtask =
+        Reflect::get(&window, &JsValue::from_str("queueMicrotask"))
+            .expect("queueMicrotask not available");
+    let queue_microtask = queue_microtask.unchecked_into::<Function>();
+    _ = queue_microtask.call1(&JsValue::UNDEFINED, &task);
+}
+
+fn queue(fun: Box<dyn FnOnce()>) {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static PENDING: Cell<bool> = const { Cell::new(false) };
+        static QUEUE: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::new(Vec::new());
+    }
+
+    QUEUE.with_borrow_mut(|q| q.push(fun));
+    if !PENDING.replace(true) {
+        queue_microtask(|| {
+            let tasks = QUEUE.take();
+            for task in tasks {
+                task();
+            }
+            PENDING.set(false);
+        })
+    }
+}
 
 impl Dom {
     pub fn intern(text: &str) -> &str {
@@ -57,7 +100,7 @@ impl Dom {
 
     pub fn create_placeholder() -> Placeholder {
         thread_local! {
-            static COMMENT: Lazy<Comment> = Lazy::new(|| {
+            static COMMENT: LazyCell<Comment> = LazyCell::new(|| {
                 document().create_comment("")
             });
         }
@@ -93,6 +136,15 @@ impl Dom {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
+    pub fn try_insert_node(
+        parent: &Element,
+        new_child: &Node,
+        anchor: Option<&Node>,
+    ) -> bool {
+        parent.insert_before(new_child, anchor).is_ok()
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub fn remove_node(parent: &Element, child: &Node) -> Option<Node> {
         ok_or_debug!(parent.remove_child(child), parent, "removeNode")
     }
@@ -112,15 +164,14 @@ impl Dom {
             let node = node.first_child();
             // if it's a comment node that starts with hot-reload, it's a marker that should be
             // ignored
-            if let Some(node) = node.as_ref() {
-                if node.node_type() == 8
-                    && node
-                        .text_content()
-                        .unwrap_or_default()
-                        .starts_with("hot-reload")
-                {
-                    return Self::next_sibling(node);
-                }
+            if let Some(node) = node.as_ref()
+                && node.node_type() == 8
+                && node
+                    .text_content()
+                    .unwrap_or_default()
+                    .starts_with("hot-reload")
+            {
+                return Self::next_sibling(node);
             }
 
             node
@@ -137,15 +188,14 @@ impl Dom {
             let node = node.next_sibling();
             // if it's a comment node that starts with hot-reload, it's a marker that should be
             // ignored
-            if let Some(node) = node.as_ref() {
-                if node.node_type() == 8
-                    && node
-                        .text_content()
-                        .unwrap_or_default()
-                        .starts_with("hot-reload")
-                {
-                    return Self::next_sibling(node);
-                }
+            if let Some(node) = node.as_ref()
+                && node.node_type() == 8
+                && node
+                    .text_content()
+                    .unwrap_or_default()
+                    .starts_with("hot-reload")
+            {
+                return Self::next_sibling(node);
             }
 
             node
@@ -198,6 +248,20 @@ impl Dom {
         }
     }
 
+    pub fn set_property_or_value(el: &Element, key: &str, value: &JsValue) {
+        if key == "value" {
+            queue(Box::new({
+                let el = el.clone();
+                let value = value.clone();
+                move || {
+                    Self::set_property(&el, "value", &value);
+                }
+            }))
+        } else {
+            Self::set_property(el, key, value);
+        }
+    }
+
     pub fn set_property(el: &Element, key: &str, value: &JsValue) {
         or_debug!(
             js_sys::Reflect::set(
@@ -229,19 +293,20 @@ impl Dom {
         // return the remover
         RemoveEventHandler::new({
             let name = name.to_owned();
+            let el = el.clone();
             // safe to construct this here, because it will only run in the browser
             // so it will always be accessed or dropped from the main thread
-            let cb = send_wrapper::SendWrapper::new(cb);
-            move |el: &Element| {
+            let cb = send_wrapper::SendWrapper::new(move || {
                 or_debug!(
                     el.remove_event_listener_with_callback(
                         intern(&name),
                         cb.as_ref().unchecked_ref()
                     ),
-                    el,
+                    &el,
                     "removeEventListener"
                 )
-            }
+            });
+            move || cb()
         })
     }
 
@@ -267,19 +332,21 @@ impl Dom {
         // return the remover
         RemoveEventHandler::new({
             let name = name.to_owned();
+            let el = el.clone();
             // safe to construct this here, because it will only run in the browser
             // so it will always be accessed or dropped from the main thread
-            let cb = send_wrapper::SendWrapper::new(cb);
-            move |el: &Element| {
+            let cb = send_wrapper::SendWrapper::new(move || {
                 or_debug!(
-                    el.remove_event_listener_with_callback(
+                    el.remove_event_listener_with_callback_and_bool(
                         intern(&name),
-                        cb.as_ref().unchecked_ref()
+                        cb.as_ref().unchecked_ref(),
+                        true
                     ),
-                    el,
+                    &el,
                     "removeEventListener"
                 )
-            }
+            });
+            move || cb()
         })
     }
 
@@ -309,8 +376,7 @@ impl Dom {
             "set property"
         );
 
-        GLOBAL_EVENTS.with(|global_events| {
-            let mut events = global_events.borrow_mut();
+        GLOBAL_EVENTS.with_borrow_mut(|events| {
             if !events.contains(&name) {
                 // create global handler
                 let key = JsValue::from_str(key);
@@ -380,17 +446,19 @@ impl Dom {
         // return the remover
         RemoveEventHandler::new({
             let key = key.to_owned();
+            let el = el.clone();
             // safe to construct this here, because it will only run in the browser
             // so it will always be accessed or dropped from the main thread
-            let cb = send_wrapper::SendWrapper::new(cb);
-            move |el: &Element| {
-                drop(cb.take());
+            let el_cb = send_wrapper::SendWrapper::new((el, cb));
+            move || {
+                let (el, cb) = el_cb.take();
+                drop(cb);
                 or_debug!(
                     js_sys::Reflect::delete_property(
-                        el,
+                        &el,
                         &JsValue::from_str(&key)
                     ),
-                    el,
+                    &el,
                     "delete property"
                 );
             }
@@ -442,15 +510,20 @@ impl Dom {
         V: ToTemplate + 'static,
     {
         thread_local! {
-            static TEMPLATE_ELEMENT: Lazy<HtmlTemplateElement> =
-                Lazy::new(|| document().create_element("template").unwrap().unchecked_into());
-            static TEMPLATES: RefCell<LinearMap<TypeId, HtmlTemplateElement>> = Default::default();
+            static TEMPLATE_ELEMENT: LazyCell<HtmlTemplateElement> =
+                LazyCell::new(|| document().create_element(Dom::intern("template")).unwrap().unchecked_into());
+            // a linear scan over a Vec outperforms a hash map at the small
+            // number of `template!` call sites found in typical apps, and
+            // avoids re-inlining map machinery into every monomorphization
+            // of this generic function (~360 bytes of .wasm per call site)
+            static TEMPLATES: RefCell<Vec<(TypeId, HtmlTemplateElement)>> = Default::default();
         }
 
-        TEMPLATES.with(|t| {
-            t.borrow_mut()
-                .entry(TypeId::of::<V>())
-                .or_insert_with(|| {
+        TEMPLATES.with_borrow_mut(|t| {
+            let id = TypeId::of::<V>();
+            t.iter()
+                .find_map(|entry| (entry.0 == id).then(|| entry.1.clone()))
+                .unwrap_or_else(|| {
                     let tpl = TEMPLATE_ELEMENT.with(|t| {
                         t.clone_node()
                             .unwrap()
@@ -465,9 +538,9 @@ impl Dom {
                         &mut Default::default(),
                     );
                     tpl.set_inner_html(&buf);
+                    t.push((id, tpl.clone()));
                     tpl
                 })
-                .clone()
         })
     }
 
@@ -478,12 +551,48 @@ impl Dom {
             .unchecked_into()
     }
 
-    pub fn create_element_from_html(html: &str) -> Element {
-        // TODO can be optimized to cache HTML strings or cache <template>?
-        let tpl = document().create_element("template").unwrap();
-        tpl.set_inner_html(html);
-        let tpl = Self::clone_template(tpl.unchecked_ref());
+    pub fn create_element_from_html(html: Cow<'static, str>) -> Element {
+        let tpl = TEMPLATE_CACHE.with_borrow_mut(|cache| {
+            let tpl = cache.entry(html).or_insert_with_key(|html| {
+                let tpl = document()
+                    .create_element(Self::intern("template"))
+                    .unwrap();
+                tpl.set_inner_html(html);
+                tpl
+            });
+            Self::clone_template(tpl.unchecked_ref())
+        });
         tpl.first_element_child().unwrap_or(tpl)
+    }
+
+    pub fn create_svg_element_from_html(html: Cow<'static, str>) -> Element {
+        let tpl = TEMPLATE_CACHE.with_borrow_mut(|cache| {
+            let tpl = cache.entry(html).or_insert_with_key(|html| {
+                let tpl = document()
+                    .create_element(Self::intern("template"))
+                    .unwrap();
+                let svg = document()
+                    .create_element_ns(
+                        Some(Self::intern("http://www.w3.org/2000/svg")),
+                        Self::intern("svg"),
+                    )
+                    .unwrap();
+                svg.set_inner_html(html);
+                tpl.unchecked_ref::<TemplateElement>()
+                    .content()
+                    .append_child(&svg)
+                    .unwrap();
+                tpl
+            });
+            Self::clone_template(tpl.unchecked_ref())
+        });
+
+        let svg = tpl.first_element_child().unwrap();
+        // The `<svg>` is only a parsing context that gives the fragment the SVG
+        // namespace; the element we actually want is its first child. Returning
+        // the `<svg>` itself would wrap every inert SVG child in a spurious
+        // `<svg>`.
+        svg.first_element_child().unwrap_or(svg)
     }
 }
 
@@ -494,6 +603,10 @@ impl Mountable for Node {
 
     fn mount(&mut self, parent: &Element, marker: Option<&Node>) {
         Dom::insert_node(parent, self, marker);
+    }
+
+    fn try_mount(&mut self, parent: &Element, marker: Option<&Node>) -> bool {
+        Dom::try_insert_node(parent, self, marker)
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
@@ -519,6 +632,10 @@ impl Mountable for Text {
         Dom::insert_node(parent, self, marker);
     }
 
+    fn try_mount(&mut self, parent: &Element, marker: Option<&Node>) -> bool {
+        Dom::try_insert_node(parent, self, marker)
+    }
+
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
         let parent =
             Dom::get_parent(self.as_ref()).and_then(Element::cast_from);
@@ -541,6 +658,10 @@ impl Mountable for Comment {
 
     fn mount(&mut self, parent: &Element, marker: Option<&Node>) {
         Dom::insert_node(parent, self, marker);
+    }
+
+    fn try_mount(&mut self, parent: &Element, marker: Option<&Node>) -> bool {
+        Dom::try_insert_node(parent, self, marker)
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {

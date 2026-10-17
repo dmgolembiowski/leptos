@@ -8,6 +8,7 @@ use crate::{
 use std::fmt::Debug;
 
 macro_rules! html_element_inner {
+    // Single escape literal: hydration follows escaping (the common case).
     (
         #[$meta:meta]
         $tag:ident
@@ -15,6 +16,27 @@ macro_rules! html_element_inner {
         $ty:ident
         [$($attr:ty),*]
         $escape:literal
+    ) => {
+        html_element_inner! {
+            #[$meta]
+            $tag
+            $struct_name
+            $ty
+            [$($attr),*]
+            $escape
+            $escape
+        }
+    };
+    // Explicit escape + hydrate literals: decouples escaping from hydration, for escapable
+    // raw-text elements (`<textarea>`/`<title>`) that are escaped but must not be hydrated.
+    (
+        #[$meta:meta]
+        $tag:ident
+        $struct_name:ident
+        $ty:ident
+        [$($attr:ty),*]
+        $escape:literal
+        $hydrate:literal
     ) => {
         paste::paste! {
             #[$meta]
@@ -79,6 +101,7 @@ macro_rules! html_element_inner {
                 const TAG: &'static str = stringify!($tag);
                 const SELF_CLOSING: bool = false;
                 const ESCAPE_CHILDREN: bool = $escape;
+                const HYDRATES_CHILDREN: bool = $hydrate;
                 const NAMESPACE: Option<&'static str> = None;
 
                 #[inline(always)]
@@ -99,6 +122,7 @@ macro_rules! html_elements {
         $ty:ident
         [$($attr:ty),*]
         $escape:literal
+        $($hydrate:literal)?
       ),*
       $(,)?
     ) => {
@@ -110,6 +134,7 @@ macro_rules! html_elements {
                 $ty
                 [$($attr),*]
                 $escape
+                $($hydrate)?
             })*
         }
     }
@@ -212,7 +237,7 @@ html_self_closing_elements! {
     /// The `<img>` HTML element embeds an image into the document.
     img HtmlImageElement [alt, attributionsrc, crossorigin, decoding, elementtiming, fetchpriority, height, ismap, loading, referrerpolicy, sizes, src, srcset, usemap, width] true,
     /// The `<input>` HTML element is used to create interactive controls for web-based forms in order to accept data from the user; a wide variety of types of input data and control widgets are available, depending on the device and user agent. The `<input>` element is one of the most powerful and complex in all of HTML due to the sheer number of combinations of input types and attributes.
-    input HtmlInputElement [accept, alt, autocomplete, capture, checked, disabled, form, formaction, formenctype, formmethod, formnovalidate, formtarget, height, list, max, maxlength, min, minlength, multiple, name, pattern, placeholder, popovertarget, popovertargetaction, readonly, required, size, src, step, r#type, value, width] true,
+    input HtmlInputElement [accept, alt, autocomplete, capture, checked, dirname, disabled, form, formaction, formenctype, formmethod, formnovalidate, formtarget, height, list, max, maxlength, min, minlength, multiple, name, pattern, placeholder, popovertarget, popovertargetaction, readonly, required, size, src, step, r#type, value, width] true,
     ///	The `<link>` HTML element specifies relationships between the current document and an external resource. This element is most commonly used to link to CSS, but is also used to establish site icons (both "favicon" style icons and icons for the home screen and apps on mobile devices) among other things.
     link HtmlLinkElement [r#as, blocking, crossorigin, fetchpriority, href, hreflang, imagesizes, imagesrcset, integrity, media, rel, referrerpolicy, sizes, r#type] true,
     ///	The `<meta>` HTML element represents Metadata that cannot be represented by other HTML meta-related elements, like base, link, script, style or title.
@@ -227,7 +252,7 @@ html_self_closing_elements! {
 
 html_elements! {
     /// The `<a>` HTML element (or anchor element), with its href attribute, creates a hyperlink to web pages, files, email addresses, locations in the same page, or anything else a URL can address.
-    a HtmlAnchorElement [download, href, hreflang, ping, rel, target, r#type ] true,
+    a HtmlAnchorElement [download, href, hreflang, ping, referrerpolicy, rel, target, r#type ] true,
     /// The `<abbr>` HTML element represents an abbreviation or acronym; the optional title attribute can provide an expansion or description for the abbreviation. If present, title must contain this full description and nothing else.
     abbr HtmlElement [] true,
     /// The `<address>` HTML element indicates that the enclosed HTML provides contact information for a person or people, or for an organization.
@@ -249,7 +274,7 @@ html_elements! {
     /// The `<body>` HTML element represents the content of an HTML document. There can be only one `<body>` element in a document.
     body HtmlBodyElement [] true,
     /// The `<button>` HTML element represents a clickable button, used to submit forms or anywhere in a document for accessible, standard button functionality.
-    button HtmlButtonElement [disabled, form, formaction, formenctype, formmethod, formnovalidate, formtarget, name, r#type, value, popovertarget, popovertargetaction] true,
+    button HtmlButtonElement [command, commandfor, disabled, form, formaction, formenctype, formmethod, formnovalidate, formtarget, name, r#type, value, popovertarget, popovertargetaction] true,
     /// Use the HTML `<canvas>` element with either the canvas scripting API or the WebGL API to draw graphics and animations.
     canvas HtmlCanvasElement [height, width] true,
     /// The `<caption>` HTML element specifies the caption (or title) of a table.
@@ -269,11 +294,11 @@ html_elements! {
     /// The `<del>` HTML element represents a range of text that has been deleted from a document. This can be used when rendering "track changes" or source code diff information, for example. The ins element can be used for the opposite purpose: to indicate text that has been added to the document.
     del HtmlModElement [cite, datetime] true,
     /// The `<details>` HTML element creates a disclosure widget in which information is visible only when the widget is toggled into an "open" state. A summary or label must be provided using the summary element.
-    details HtmlDetailsElement [open] true,
+    details HtmlDetailsElement [name, open] true,
     /// The `<dfn>` HTML element is used to indicate the term being defined within the context of a definition phrase or sentence. The p element, the dt/dd pairing, or the section element which is the nearest ancestor of the `<dfn>` is considered to be the definition of the term.
     dfn HtmlElement [] true,
     /// The `<dialog>` HTML element represents a dialog box or other interactive component, such as a dismissible alert, inspector, or subwindow.
-    dialog HtmlDialogElement [open] true,
+    dialog HtmlDialogElement [closedby, open] true,
     /// The `<div>` HTML element is the generic container for flow content. It has no effect on the content or layout until styled in some way using CSS (e.g. styling is directly applied to it, or some kind of layout model like Flexbox is applied to its parent element).
     div HtmlDivElement [] true,
     /// The `<dl>` HTML element represents a description list. The element encloses a list of groups of terms (specified using the dt element) and descriptions (provided by dd elements). Common uses for this element are to implement a glossary or to display metadata (a list of key-value pairs).
@@ -403,7 +428,7 @@ html_elements! {
     /// The `<template>` HTML element is a mechanism for holding HTML that is not to be rendered immediately when a page is loaded but may be instantiated subsequently during runtime using JavaScript.
     template HtmlTemplateElement [] true,
     /// The `<textarea>` HTML element represents a multi-line plain-text editing control, useful when you want to allow users to enter a sizeable amount of free-form text, for example a comment on a review or feedback form.
-    textarea HtmlTextAreaElement [autocomplete, cols, dirname, disabled, form, maxlength, minlength, name, placeholder, readonly, required, rows, wrap] false,
+    textarea HtmlTextAreaElement [autocomplete, cols, dirname, disabled, form, maxlength, minlength, name, placeholder, readonly, required, rows, wrap] true false,
     /// The `<tfoot>` HTML element defines a set of rows summarizing the columns of the table.
     tfoot HtmlTableSectionElement [] true,
     /// The `<th>` HTML element defines a cell as header of a group of table cells. The exact nature of this group is defined by the scope and headers attributes.
@@ -413,7 +438,7 @@ html_elements! {
     /// The `<time>` HTML element represents a specific period in time. It may include the datetime attribute to translate dates into machine-readable format, allowing for better search engine results or custom features such as reminders.
     time HtmlTimeElement [datetime] true,
     ///	The `<title>` HTML element defines the document's title that is shown in a Browser's title bar or a page's tab. It only contains text; tags within the element are ignored.
-    title HtmlTitleElement [] true,
+    title HtmlTitleElement [] true false,
     /// The `<tr>` HTML element defines a row of cells in a table. The row's cells can then be established using a mix of td (data cell) and th (header cell) elements.
     tr HtmlTableRowElement [] true,
     /// The `<u>` HTML element represents a span of inline text which should be rendered in a way that indicates that it has a non-textual annotation. This is rendered by default as a simple solid underline, but may be altered using CSS.
@@ -429,4 +454,93 @@ html_elements! {
 html_element_inner! {
     /// The `<option>` HTML element is used to define an item contained in a `<select>`, an` <optgroup>`, or a `<datalist>` element. As such, `<option>` can represent menu items in popups and other lists of items in an HTML document.
     option Option_ HtmlOptionElement [disabled, label, selected, value] true
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use crate::{
+        html::element::{
+            ElementChild, noscript, script, style, textarea, title,
+        },
+        view::RenderHtml,
+    };
+
+    #[test]
+    fn textarea_escapes_child_content() {
+        // `<textarea>` content is escapable raw text per the HTML spec, so a
+        // child string containing `</textarea>` or `<script>` must be escaped
+        // rather than written verbatim.
+        let untrusted = "</textarea><script>alert('xss')</script>".to_string();
+        let html = textarea().child(untrusted).to_html();
+        assert_eq!(
+            html,
+            "<textarea>&lt;/textarea&gt;&lt;script&gt;alert('xss')&lt;/script&\
+             gt;</textarea>"
+        );
+    }
+
+    #[test]
+    fn escapable_raw_text_children_have_no_hydration_marker() {
+        // Variable-length child containers (`Vec`/`StaticVec`, used to hold an
+        // element's children in erased/lazy mode) append a trailing `<!>`
+        // hydration marker. `<textarea>`/`<title>` escape their children but are
+        // *not* hydrated, so that marker must not leak into their raw-text content
+        // (it would render as literal text, e.g. `hey<!>`).
+        assert_eq!(
+            textarea().child(vec!["hey"]).to_html(),
+            "<textarea>hey</textarea>"
+        );
+        assert_eq!(title().child(vec!["hey"]).to_html(), "<title>hey</title>");
+        // Escaping still applies to the (marker-free) rendered content.
+        assert_eq!(
+            textarea().child(vec!["a < b"]).to_html(),
+            "<textarea>a &lt; b</textarea>"
+        );
+    }
+
+    #[tokio::test]
+    async fn escapable_raw_text_children_have_no_hydration_marker_streaming() {
+        // The axum/actix integrations render via out-of-order streaming, so the
+        // async path must suppress the marker too.
+        use futures::StreamExt;
+
+        let mut stream =
+            textarea().child(vec!["hey"]).to_html_stream_out_of_order();
+        let mut html = String::new();
+        while let Some(chunk) = stream.next().await {
+            html.push_str(&chunk);
+        }
+        assert_eq!(html, "<textarea>hey</textarea>");
+    }
+
+    #[test]
+    fn title_escapes_child_content() {
+        // `<title>` is escapable raw text just like `<textarea>`, so it is
+        // escaped (and, like `<textarea>`, not hydrated).
+        let untrusted = "</title><script>alert('xss')</script>".to_string();
+        let html = title().child(untrusted).to_html();
+        assert_eq!(
+            html,
+            "<title>&lt;/title&gt;&lt;script&gt;alert('xss')&lt;/script&gt;</\
+             title>"
+        );
+    }
+
+    #[test]
+    fn raw_text_elements_render_children_verbatim() {
+        // Raw-text elements emit children verbatim: `<`/`&` are NOT
+        // entity-escaped (escaping would corrupt the embedded JS/CSS).
+        assert_eq!(
+            script().child("if (1 < 2 && 3 > 2) load();").to_html(),
+            "<script>if (1 < 2 && 3 > 2) load();</script>"
+        );
+        assert_eq!(
+            style().child("a::before { content: '<'; }").to_html(),
+            "<style>a::before { content: '<'; }</style>"
+        );
+        assert_eq!(
+            noscript().child("<p>enable JS</p>").to_html(),
+            "<noscript><p>enable JS</p></noscript>"
+        );
+    }
 }

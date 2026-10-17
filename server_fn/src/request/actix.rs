@@ -3,10 +3,10 @@ use crate::{
     request::Req,
     response::actix::ActixResponse,
 };
-use actix_web::{web::Payload, HttpRequest};
+use actix_web::{FromRequest, HttpRequest, web::Payload};
 use actix_ws::Message;
 use bytes::Bytes;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, SinkExt, Stream, StreamExt};
 use send_wrapper::SendWrapper;
 use std::{borrow::Cow, future::Future};
 
@@ -25,7 +25,7 @@ impl ActixRequest {
 
     fn header(&self, name: &str) -> Option<Cow<'_, str>> {
         self.0
-             .0
+            .0
             .headers()
             .get(name)
             .map(|h| String::from_utf8_lossy(h.as_bytes()))
@@ -38,14 +38,17 @@ impl From<(HttpRequest, Payload)> for ActixRequest {
     }
 }
 
-impl<E> Req<E> for ActixRequest
+impl<Error, InputStreamError, OutputStreamError>
+    Req<Error, InputStreamError, OutputStreamError> for ActixRequest
 where
-    E: FromServerFnError + Send,
+    Error: FromServerFnError + Send,
+    InputStreamError: FromServerFnError + Send,
+    OutputStreamError: FromServerFnError + Send,
 {
     type WebsocketResponse = ActixResponse;
 
     fn as_query(&self) -> Option<&str> {
-        self.0 .0.uri().query()
+        self.0.0.uri().query()
     }
 
     fn to_content_type(&self) -> Option<Cow<'_, str>> {
@@ -60,30 +63,37 @@ where
         self.header("Referer")
     }
 
-    fn try_into_bytes(self) -> impl Future<Output = Result<Bytes, E>> + Send {
+    fn try_into_bytes(
+        self,
+    ) -> impl Future<Output = Result<Bytes, Error>> + Send {
         // Actix is going to keep this on a single thread anyway so it's fine to wrap it
         // with SendWrapper, which makes it `Send` but will panic if it moves to another thread
         SendWrapper::new(async move {
-            let payload = self.0.take().1;
-            payload.to_bytes().await.map_err(|e| {
+            let (req, payload) = self.0.take();
+            let mut payload = payload.into_inner();
+            Bytes::from_request(&req, &mut payload).await.map_err(|e| {
                 ServerFnErrorErr::Deserialization(e.to_string())
                     .into_app_error()
             })
         })
     }
 
-    fn try_into_string(self) -> impl Future<Output = Result<String, E>> + Send {
+    fn try_into_string(
+        self,
+    ) -> impl Future<Output = Result<String, Error>> + Send {
         // Actix is going to keep this on a single thread anyway so it's fine to wrap it
         // with SendWrapper, which makes it `Send` but will panic if it moves to another thread
         SendWrapper::new(async move {
-            let payload = self.0.take().1;
-            let bytes = payload.to_bytes().await.map_err(|e| {
-                E::from_server_fn_error(ServerFnErrorErr::Deserialization(
-                    e.to_string(),
-                ))
-            })?;
+            let (req, payload) = self.0.take();
+            let mut payload = payload.into_inner();
+            let bytes =
+                Bytes::from_request(&req, &mut payload).await.map_err(|e| {
+                    Error::from_server_fn_error(
+                        ServerFnErrorErr::Deserialization(e.to_string()),
+                    )
+                })?;
             String::from_utf8(bytes.into()).map_err(|e| {
-                E::from_server_fn_error(ServerFnErrorErr::Deserialization(
+                Error::from_server_fn_error(ServerFnErrorErr::Deserialization(
                     e.to_string(),
                 ))
             })
@@ -92,12 +102,15 @@ where
 
     fn try_into_stream(
         self,
-    ) -> Result<impl Stream<Item = Result<Bytes, E>> + Send, E> {
+    ) -> Result<impl Stream<Item = Result<Bytes, Bytes>> + Send, Error> {
         let payload = self.0.take().1;
         let stream = payload.map(|res| {
             res.map_err(|e| {
-                ServerFnErrorErr::Deserialization(e.to_string())
-                    .into_app_error()
+                Error::from_server_fn_error(ServerFnErrorErr::Deserialization(
+                    e.to_string(),
+                ))
+                .ser()
+                .body
             })
         });
         Ok(SendWrapper::new(stream))
@@ -107,16 +120,17 @@ where
         self,
     ) -> Result<
         (
-            impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-            impl futures::Sink<Result<Bytes, E>> + Send + 'static,
+            impl Stream<Item = Result<Bytes, Bytes>> + Send + 'static,
+            impl futures::Sink<Bytes> + Send + 'static,
+            impl Future<Output = ()> + Send + 'static,
             Self::WebsocketResponse,
         ),
-        E,
+        Error,
     > {
         let (request, payload) = self.0.take();
         let (response, mut session, mut msg_stream) =
             actix_ws::handle(&request, payload).map_err(|e| {
-                E::from_server_fn_error(ServerFnErrorErr::Request(
+                Error::from_server_fn_error(ServerFnErrorErr::Request(
                     e.to_string(),
                 ))
             })?;
@@ -124,7 +138,8 @@ where
         let (mut response_stream_tx, response_stream_rx) =
             futures::channel::mpsc::channel(2048);
         let (response_sink_tx, mut response_sink_rx) =
-            futures::channel::mpsc::channel(2048);
+            futures::channel::mpsc::channel::<Bytes>(2048);
+        let (closed_tx, closed_rx) = futures::channel::oneshot::channel::<()>();
 
         actix_web::rt::spawn(async move {
             loop {
@@ -133,16 +148,10 @@ where
                         let Some(incoming) = incoming else {
                             break;
                         };
-                        match incoming {
-                            Ok(message) => {
-                                if let Err(err) = session.binary(message).await {
-                                    _ = response_stream_tx.start_send(Err(E::from_server_fn_error(ServerFnErrorErr::Request(err.to_string()))));
-                                }
+                        if let Err(err) = session.binary(incoming).await
+                            && response_stream_tx.send(Err(InputStreamError::from_server_fn_error(ServerFnErrorErr::Request(err.to_string())).ser().body)).await.is_err() {
+                                break;
                             }
-                            Err(err) => {
-                                _ = response_stream_tx.start_send(Err(err));
-                            }
-                        }
                     },
                     outgoing = msg_stream.next().fuse() => {
                         let Some(outgoing) = outgoing else {
@@ -155,29 +164,37 @@ where
                                 }
                             }
                             Ok(Message::Binary(bytes)) => {
-                                _ = response_stream_tx
-                                    .start_send(
-                                        Ok(bytes),
-                                    );
+                                if response_stream_tx.send(Ok(bytes)).await.is_err() {
+                                    break;
+                                }
                             }
                             Ok(Message::Text(text)) => {
-                                _ = response_stream_tx.start_send(Ok(text.into_bytes()));
+                                if response_stream_tx.send(Ok(text.into_bytes())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(Message::Close(_)) => {
+                                break;
                             }
                             Ok(_other) => {
                             }
                             Err(e) => {
-                                _ = response_stream_tx.start_send(Err(E::from_server_fn_error(ServerFnErrorErr::Response(e.to_string()))));
+                                if response_stream_tx.send(Err(InputStreamError::from_server_fn_error(ServerFnErrorErr::Response(e.to_string())).ser().body)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
             let _ = session.close(None).await;
+            drop(closed_tx);
         });
 
         Ok((
             response_stream_rx,
             response_sink_tx,
+            closed_rx.map(|_| ()),
             ActixResponse::from(response),
         ))
     }

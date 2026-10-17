@@ -1,6 +1,6 @@
 use crate::{
-    channel::{channel, Receiver},
-    effect::{inner::EffectInner, EffectFunction},
+    channel::{Receiver, channel},
+    effect::{EffectFunction, inner::EffectInner},
     graph::{
         AnySubscriber, ReactiveNode, SourceSet, Subscriber, ToAnySubscriber,
         WithObserver,
@@ -13,7 +13,7 @@ use futures::StreamExt;
 use or_poisoned::OrPoisoned;
 use std::{
     mem,
-    sync::{atomic::AtomicBool, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
 /// Effects run a certain chunk of code whenever the signals they depend on change.
@@ -110,10 +110,12 @@ fn effect_base() -> (Receiver, Owner, Arc<RwLock<EffectInner>>) {
     (rx, owner, inner)
 }
 
+#[cfg(debug_assertions)]
 thread_local! {
     static EFFECT_SCOPE_ACTIVE: AtomicBool = const { AtomicBool::new(false) };
 }
 
+#[cfg(debug_assertions)]
 /// Returns whether the current thread is currently running an effect.
 pub fn in_effect_scope() -> bool {
     EFFECT_SCOPE_ACTIVE
@@ -123,14 +125,22 @@ pub fn in_effect_scope() -> bool {
 /// Set a static to true whilst running the given function.
 /// [`is_in_effect_scope`] will return true whilst the function is running.
 fn run_in_effect_scope<T>(fun: impl FnOnce() -> T) -> T {
-    // For the theoretical nested case, set back to initial value rather than false:
-    let initial = EFFECT_SCOPE_ACTIVE
-        .with(|scope| scope.swap(true, std::sync::atomic::Ordering::Relaxed));
-    let result = fun();
-    EFFECT_SCOPE_ACTIVE.with(|scope| {
-        scope.store(initial, std::sync::atomic::Ordering::Relaxed)
-    });
-    result
+    #[cfg(debug_assertions)]
+    {
+        // For the theoretical nested case, set back to initial value rather than false:
+        let initial = EFFECT_SCOPE_ACTIVE.with(|scope| {
+            scope.swap(true, std::sync::atomic::Ordering::Relaxed)
+        });
+        let result = fun();
+        EFFECT_SCOPE_ACTIVE.with(|scope| {
+            scope.store(initial, std::sync::atomic::Ordering::Relaxed)
+        });
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        fun()
+    }
 }
 
 impl<S> Effect<S>
@@ -272,9 +282,9 @@ impl Effect<LocalStorage> {
     ///
     /// ## Immediate
     ///
-    /// If the final parameter `immediate` is true, the `callback` will run immediately.
-    /// If it's `false`, the `callback` will run only after
-    /// the first change is detected of any signal that is accessed in `deps`.
+    /// If the final parameter `immediate` is true, the `handler` will run immediately.
+    /// If it's `false`, the `handler` will run only after
+    /// the first change is detected of any signal that is accessed in `dependency_fn`.
     ///
     /// ```
     /// # use reactive_graph::effect::Effect;
@@ -438,9 +448,9 @@ impl Effect<SyncStorage> {
     pub fn watch_sync<D, T>(
         mut dependency_fn: impl FnMut() -> D + Send + Sync + 'static,
         mut handler: impl FnMut(&D, Option<&D>, Option<T>) -> T
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
         immediate: bool,
     ) -> Self
     where

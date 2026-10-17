@@ -1,10 +1,10 @@
 use super::{ElementWithChildren, HtmlElement};
 use crate::{
     html::attribute::{
+        Attribute, NamedAttributeKey, NextAttribute,
         maybe_next_attr_erasure_macros::{
             next_attr_combine, next_attr_output_type,
         },
-        Attribute, NextAttribute,
     },
     renderer::Rndr,
     view::add_attr::AddAnyAttr,
@@ -105,6 +105,10 @@ where
             value: self.value.resolve().await,
         }
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::InnerHtml]
+    }
 }
 
 impl<T> NextAttribute for InnerHtml<T>
@@ -125,7 +129,6 @@ where
 pub trait InnerHtmlAttribute<T>
 where
     T: InnerHtmlValue,
-
     Self: Sized + AddAnyAttr,
 {
     /// Sets the inner HTML of this element.
@@ -292,7 +295,7 @@ impl InnerHtmlValue for Arc<str> {
     }
 
     fn rebuild(self, state: &mut Self::State) {
-        if !Arc::ptr_eq(&self, &state.1) {
+        if self != state.1 {
             Rndr::set_inner_html(&state.0, &self);
             state.1 = self;
         }

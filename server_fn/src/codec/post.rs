@@ -1,9 +1,9 @@
 use super::{Encoding, FromReq, FromRes, IntoReq, IntoRes};
 use crate::{
+    ContentType, Decodes, Encodes,
     error::{FromServerFnError, IntoAppError, ServerFnErrorErr},
     request::{ClientReq, Req},
     response::{ClientRes, TryRes},
-    ContentType, Decodes, Encodes,
 };
 use std::marker::PhantomData;
 
@@ -25,10 +25,10 @@ where
     E: FromServerFnError,
 {
     fn into_req(self, path: &str, accepts: &str) -> Result<Request, E> {
-        let data = Encoding::encode(self).map_err(|e| {
+        let data = Encoding::encode(&self).map_err(|e| {
             ServerFnErrorErr::Serialization(e.to_string()).into_app_error()
         })?;
-        Request::try_new_post_bytes(path, accepts, Encoding::CONTENT_TYPE, data)
+        Request::try_new_post_bytes(path, Encoding::CONTENT_TYPE, accepts, data)
     }
 }
 
@@ -55,7 +55,7 @@ where
     T: Send,
 {
     async fn into_res(self) -> Result<Response, E> {
-        let data = Encoding::encode(self).map_err(|e| {
+        let data = Encoding::encode(&self).map_err(|e| {
             ServerFnErrorErr::Serialization(e.to_string()).into_app_error()
         })?;
         Response::try_from_bytes(Encoding::CONTENT_TYPE, data)

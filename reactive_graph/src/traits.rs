@@ -48,13 +48,13 @@
 //! there isn't an `RwLock` so you can't wrap in a [`ReadGuard`](crate::signal::guards::ReadGuard),
 //! but you can still implement [`WithUntracked`] and [`Track`], the same traits will still be implemented.
 
-pub use crate::trait_options::*;
 use crate::{
     effect::Effect,
     graph::{Observer, Source, Subscriber, ToAnySource},
     owner::Owner,
-    signal::{arc_signal, guards::UntrackedWriteGuard, ArcReadSignal},
+    signal::{ArcReadSignal, arc_signal, guards::UntrackedWriteGuard},
 };
+pub use crate::{signal_or_fn::SignalOrFn, trait_options::*};
 use any_spawner::Executor;
 use futures::{Stream, StreamExt};
 use std::{
@@ -228,6 +228,12 @@ where
 pub trait UntrackableGuard: DerefMut {
     /// Removes the notifier from the guard, such that it will no longer notify subscribers when it is dropped.
     fn untrack(&mut self);
+}
+
+impl<T> UntrackableGuard for Box<dyn UntrackableGuard<Target = T>> {
+    fn untrack(&mut self) {
+        (**self).untrack();
+    }
 }
 
 /// Gives mutable access to a signal's value through a guard type. When the guard is dropped, the
@@ -539,7 +545,19 @@ where
 
     #[track_caller]
     fn set(&self, value: Self::Value) {
-        self.try_update(|n| *n = value);
+        let failed = self.try_update(|n| *n = value).is_none();
+
+        #[cfg(any(debug_assertions, leptos_debuginfo))]
+        if failed && !self.is_disposed() {
+            let called_at = Location::caller();
+            let ty = std::any::type_name::<Self::Value>();
+
+            crate::log_warning(format_args!(
+                "At {called_at}, you tried to update a {ty}, but the update \
+                 failed. This can happen if a read guard over the value is \
+                 still alive."
+            ));
+        };
     }
 
     #[track_caller]
@@ -637,7 +655,7 @@ pub trait IntoInner {
     /// The type of the value contained in the signal.
     type Value;
 
-    /// Returns the inner value if this is the only reference to to the signal.
+    /// Returns the inner value if this is the only reference to the signal.
     /// Otherwise, returns `None` and drops this reference.
     /// # Panics
     /// Panics if the inner lock is poisoned.

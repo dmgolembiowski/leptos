@@ -1,6 +1,6 @@
 use super::attribute::{
-    maybe_next_attr_erasure_macros::next_attr_output_type, Attribute,
-    NextAttribute,
+    Attribute, NamedAttributeKey, NextAttribute,
+    maybe_next_attr_erasure_macros::next_attr_output_type,
 };
 use crate::{
     html::attribute::maybe_next_attr_erasure_macros::next_attr_combine,
@@ -57,6 +57,10 @@ where
         _style: &mut String,
         _inner_html: &mut String,
     ) {
+        // If this is a class="..." attribute (not class:name=value), clear previous value
+        if self.class.should_overwrite() {
+            class.clear();
+        }
         class.push(' ');
         self.class.to_html(class);
     }
@@ -96,6 +100,10 @@ where
         Class {
             class: self.class.resolve().await,
         }
+    }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        vec![NamedAttributeKey::Attribute("class".into())]
     }
 }
 
@@ -151,6 +159,12 @@ pub trait IntoClass: Send {
 
     /// Renders the class to HTML.
     fn to_html(self, class: &mut String);
+
+    /// Whether this class attribute should overwrite previous class values.
+    /// Returns `true` for `class="..."` attributes, `false` for `class:name=value` directives.
+    fn should_overwrite(&self) -> bool {
+        false
+    }
 
     /// Renders the class to HTML for a `<template>`.
     #[allow(unused)] // it's used with `nightly` feature
@@ -285,6 +299,10 @@ impl IntoClass for &str {
         class.push_str(self);
     }
 
+    fn should_overwrite(&self) -> bool {
+        true
+    }
+
     fn hydrate<const FROM_SERVER: bool>(
         self,
         el: &crate::renderer::types::Element,
@@ -340,6 +358,10 @@ impl IntoClass for Cow<'_, str> {
 
     fn to_html(self, class: &mut String) {
         IntoClass::to_html(&*self, class);
+    }
+
+    fn should_overwrite(&self) -> bool {
+        true
     }
 
     fn hydrate<const FROM_SERVER: bool>(
@@ -399,6 +421,10 @@ impl IntoClass for String {
         IntoClass::to_html(self.as_str(), class);
     }
 
+    fn should_overwrite(&self) -> bool {
+        true
+    }
+
     fn hydrate<const FROM_SERVER: bool>(
         self,
         el: &crate::renderer::types::Element,
@@ -456,6 +482,10 @@ impl IntoClass for Arc<str> {
         IntoClass::to_html(self.as_ref(), class);
     }
 
+    fn should_overwrite(&self) -> bool {
+        true
+    }
+
     fn hydrate<const FROM_SERVER: bool>(
         self,
         el: &crate::renderer::types::Element,
@@ -473,7 +503,7 @@ impl IntoClass for Arc<str> {
 
     fn rebuild(self, state: &mut Self::State) {
         let (el, prev) = state;
-        if !Arc::ptr_eq(&self, prev) {
+        if self != *prev {
             Rndr::set_attribute(el, "class", &self);
         }
         *prev = self;
@@ -540,11 +570,20 @@ impl IntoClass for (&'static str, bool) {
     fn rebuild(self, state: &mut Self::State) {
         let (name, include) = self;
         let (class_list, prev_include, prev_name) = state;
-        if include != *prev_include {
+        if name == *prev_name {
+            if include != *prev_include {
+                if include {
+                    Rndr::add_class(class_list, name);
+                } else {
+                    Rndr::remove_class(class_list, name);
+                }
+            }
+        } else {
+            if *prev_include {
+                Rndr::remove_class(class_list, prev_name);
+            }
             if include {
                 Rndr::add_class(class_list, name);
-            } else {
-                Rndr::remove_class(class_list, name);
             }
         }
         *prev_include = include;
@@ -571,7 +610,7 @@ impl IntoClass for (&'static str, bool) {
     }
 }
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const V: &'static str> IntoClass for crate::view::static_types::Static<V> {
     const TEMPLATE: &'static str = V;
 

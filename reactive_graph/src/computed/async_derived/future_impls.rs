@@ -1,9 +1,10 @@
-use super::{inner::ArcAsyncDerivedInner, ArcAsyncDerived, AsyncDerived};
+use super::{ArcAsyncDerived, AsyncDerived, inner::ArcAsyncDerivedInner};
 use crate::{
     computed::suspense::SuspenseContext,
     diagnostics::SpecialNonReactiveZone,
     graph::{AnySource, ToAnySource},
-    owner::{use_context, Storage},
+    owner::{Storage, use_context},
+    send_wrapper_ext::SendOption,
     signal::guards::{AsyncPlain, Mapped, ReadGuard},
     traits::{DefinedAt, Track},
     unwrap_signal,
@@ -14,8 +15,8 @@ use std::{
     future::{Future, IntoFuture},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -24,7 +25,8 @@ use std::{
 ///
 /// Implements [`Deref`](std::ops::Deref) to access the inner value. This should not be held longer
 /// than it is needed, as it prevents updates to the inner value.
-pub type AsyncDerivedGuard<T> = ReadGuard<T, Mapped<AsyncPlain<Option<T>>, T>>;
+pub type AsyncDerivedGuard<T> =
+    ReadGuard<T, Mapped<AsyncPlain<SendOption<T>>, T>>;
 
 /// A [`Future`] that is ready when an [`ArcAsyncDerived`] is finished loading or reloading,
 /// but does not contain its value.
@@ -57,8 +59,10 @@ impl Future for AsyncDerivedReadyFuture {
         let _guard = SpecialNonReactiveZone::enter();
         let waker = cx.waker();
         self.source.track();
+        // hold the `wakers` lock across the change in `loading`
+        let mut wakers = self.wakers.write().or_poisoned();
         if self.loading.load(Ordering::Relaxed) {
-            self.wakers.write().or_poisoned().push(waker.clone());
+            wakers.push(waker.clone());
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -106,7 +110,7 @@ where
 /// and contains its value. `.await`ing this clones the value `T`.
 pub struct AsyncDerivedFuture<T> {
     source: AnySource,
-    value: Arc<async_lock::RwLock<Option<T>>>,
+    value: Arc<async_lock::RwLock<SendOption<T>>>,
     loading: Arc<AtomicBool>,
     wakers: Arc<RwLock<Vec<Waker>>>,
     inner: Arc<RwLock<ArcAsyncDerivedInner>>,
@@ -135,9 +139,10 @@ where
         }
 
         pin_mut!(value);
+        let mut wakers = self.wakers.write().or_poisoned();
         match (self.loading.load(Ordering::Relaxed), value.poll(cx)) {
             (true, _) => {
-                self.wakers.write().or_poisoned().push(waker.clone());
+                wakers.push(waker.clone());
                 Poll::Pending
             }
             (_, Poll::Pending) => Poll::Pending,
@@ -183,7 +188,7 @@ where
 /// and yields an [`AsyncDerivedGuard`] that dereferences to its value.
 pub struct AsyncDerivedRefFuture<T> {
     source: AnySource,
-    value: Arc<async_lock::RwLock<Option<T>>>,
+    value: Arc<async_lock::RwLock<SendOption<T>>>,
     loading: Arc<AtomicBool>,
     wakers: Arc<RwLock<Vec<Waker>>>,
 }
@@ -201,9 +206,10 @@ where
         self.source.track();
         let value = self.value.read_arc();
         pin_mut!(value);
+        let mut wakers = self.wakers.write().or_poisoned();
         match (self.loading.load(Ordering::Relaxed), value.poll(cx)) {
             (true, _) => {
-                self.wakers.write().or_poisoned().push(waker.clone());
+                wakers.push(waker.clone());
                 Poll::Pending
             }
             (_, Poll::Pending) => Poll::Pending,

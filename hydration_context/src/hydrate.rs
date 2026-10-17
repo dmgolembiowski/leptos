@@ -7,18 +7,20 @@ use super::{SerializedDataId, SharedContext};
 use crate::{PinnedFuture, PinnedStream};
 use core::fmt::Debug;
 use js_sys::Array;
-use once_cell::sync::Lazy;
 use std::{
     fmt::Display,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use throw_error::{Error, ErrorId};
-use wasm_bindgen::{prelude::wasm_bindgen, JsCast};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(thread_local)]
-    static __RESOLVED_RESOURCES: Array;
+    static __RESOLVED_RESOURCES: JsValue;
 
     #[wasm_bindgen(thread_local)]
     static __SERIALIZED_ERRORS: Array;
@@ -28,34 +30,38 @@ extern "C" {
 }
 
 fn serialized_errors() -> Vec<(SerializedDataId, ErrorId, Error)> {
+    // Treat `__SERIALIZED_ERRORS` as untrusted input: a truncated stream,
+    // a version mismatch between server and client, a proxy that mangles
+    // the script, or any other source of malformed entries would
+    // otherwise panic the entire hydration step. Skip-and-continue is
+    // safer than unwrap-and-die.
     __SERIALIZED_ERRORS.with(|s| {
         s.iter()
-            .flat_map(|value| {
-                value.dyn_ref::<Array>().map(|value| {
-                    let error_boundary_id =
-                        value.get(0).as_f64().unwrap() as usize;
-                    let error_id = value.get(1).as_f64().unwrap() as usize;
-                    let value = value
-                        .get(2)
-                        .as_string()
-                        .expect("Expected a [number, string] tuple");
-                    (
-                        SerializedDataId(error_boundary_id),
-                        ErrorId::from(error_id),
-                        Error::from(SerializedError(value)),
-                    )
-                })
+            .filter_map(|value| {
+                let entry = value.dyn_ref::<Array>()?;
+                let error_boundary_id = entry.get(0).as_string()?;
+                let error_id = entry.get(1).as_string()?;
+                let msg = entry.get(2).as_string()?;
+                Some((
+                    SerializedDataId(error_boundary_id),
+                    ErrorId::from(error_id),
+                    // `SerializedError` is a concrete `std::error::Error`, so
+                    // build it in a single allocation via `Error::new`.
+                    Error::new(SerializedError(msg)),
+                ))
             })
             .collect()
     })
 }
 
 fn incomplete_chunks() -> Vec<SerializedDataId> {
+    // Same robustness contract as `serialized_errors`: a malformed entry
+    // is dropped rather than panicking hydration.
     __INCOMPLETE_CHUNKS.with(|i| {
         i.iter()
-            .map(|value| {
-                let id = value.as_f64().unwrap() as usize;
-                SerializedDataId(id)
+            .filter_map(|value| {
+                let id = value.as_string()?;
+                Some(SerializedDataId(id))
             })
             .collect()
     })
@@ -79,8 +85,8 @@ pub struct HydrateSharedContext {
     id: AtomicUsize,
     is_hydrating: AtomicBool,
     during_hydration: AtomicBool,
-    errors: Lazy<Vec<(SerializedDataId, ErrorId, Error)>>,
-    incomplete: Lazy<Vec<SerializedDataId>>,
+    errors: LazyLock<Vec<(SerializedDataId, ErrorId, Error)>>,
+    incomplete: LazyLock<Vec<SerializedDataId>>,
 }
 
 impl HydrateSharedContext {
@@ -90,8 +96,8 @@ impl HydrateSharedContext {
             id: AtomicUsize::new(0),
             is_hydrating: AtomicBool::new(true),
             during_hydration: AtomicBool::new(true),
-            errors: Lazy::new(serialized_errors),
-            incomplete: Lazy::new(incomplete_chunks),
+            errors: LazyLock::new(serialized_errors),
+            incomplete: LazyLock::new(incomplete_chunks),
         }
     }
 
@@ -104,8 +110,8 @@ impl HydrateSharedContext {
             id: AtomicUsize::new(0),
             is_hydrating: AtomicBool::new(false),
             during_hydration: AtomicBool::new(true),
-            errors: Lazy::new(serialized_errors),
-            incomplete: Lazy::new(incomplete_chunks),
+            errors: LazyLock::new(serialized_errors),
+            incomplete: LazyLock::new(incomplete_chunks),
         }
     }
 }
@@ -123,13 +129,20 @@ impl SharedContext for HydrateSharedContext {
 
     fn next_id(&self) -> SerializedDataId {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
-        SerializedDataId(id)
+        SerializedDataId::new(id)
     }
 
     fn write_async(&self, _id: SerializedDataId, _fut: PinnedFuture<String>) {}
 
     fn read_data(&self, id: &SerializedDataId) -> Option<String> {
-        __RESOLVED_RESOURCES.with(|r| r.get(id.0 as u32).as_string())
+        if !self.during_hydration() {
+            return None;
+        }
+        __RESOLVED_RESOURCES.with(|r| {
+            js_sys::Reflect::get(r, &JsValue::from_str(&id.0))
+                .ok()?
+                .as_string()
+        })
     }
 
     fn await_data(&self, _id: &SerializedDataId) -> Option<String> {
@@ -157,6 +170,9 @@ impl SharedContext for HydrateSharedContext {
     }
 
     fn errors(&self, boundary_id: &SerializedDataId) -> Vec<(ErrorId, Error)> {
+        if !self.during_hydration() {
+            return Vec::new();
+        }
         self.errors
             .iter()
             .filter_map(|(boundary, id, error)| {
@@ -197,6 +213,7 @@ impl SharedContext for HydrateSharedContext {
     fn set_incomplete_chunk(&self, _id: SerializedDataId) {}
 
     fn get_incomplete_chunk(&self, id: &SerializedDataId) -> bool {
-        self.incomplete.iter().any(|entry| entry == id)
+        self.during_hydration()
+            && self.incomplete.iter().any(|entry| entry == id)
     }
 }

@@ -2,8 +2,8 @@ use super::ArcMemo;
 use crate::{
     owner::{ArenaItem, FromLocal, LocalStorage, Storage, SyncStorage},
     signal::{
-        guards::{Mapped, Plain, ReadGuard},
         ArcReadSignal,
+        guards::{Mapped, Plain, ReadGuard},
     },
     traits::{DefinedAt, Dispose, Get, ReadUntracked, Track},
     unwrap_signal,
@@ -27,7 +27,7 @@ use std::{fmt::Debug, hash::Hash, panic::Location};
 /// not re-run the calculation when a source signal changes until they are read again.
 ///
 /// This is an arena-allocated type, which is `Copy` and is disposed when its reactive
-/// [`Owner`](crate::owner::Owner) cleans up. For a reference-counted signal that livesas
+/// [`Owner`](crate::owner::Owner) cleans up. For a reference-counted signal that lives as
 /// as long as a reference to it is alive, see [`ArcMemo`].
 ///
 /// ```
@@ -63,7 +63,7 @@ use std::{fmt::Debug, hash::Hash, panic::Location};
 /// let memoized = Memo::new(move |_| really_expensive_computation(value.get()));
 /// Effect::new(move |_| {
 ///   // 🆗 reads the current value of the memo
-///   //    can be `memoized()` on nightly
+///   //    this can also be called as `memoized()`
 ///   println!("memoized = {}", memoized.get());
 /// });
 /// Effect::new(move |_| {

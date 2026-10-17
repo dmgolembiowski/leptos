@@ -2,11 +2,11 @@ use super::Lang;
 use crate::{
     html::{
         attribute::*,
-        class::{class, Class, IntoClass},
+        class::{Class, IntoClass, class},
         element::{ElementType, HasElementType, HtmlElement},
-        event::{on, on_target, EventDescriptor, On, Targeted},
-        property::{prop, IntoProperty, Property},
-        style::{style, IntoStyle, Style},
+        event::{EventDescriptor, On, Targeted, on, on_target},
+        property::{IntoProperty, Property, prop},
+        style::{IntoStyle, Style, style},
     },
     prelude::RenderHtml,
     view::add_attr::AddAnyAttr,
@@ -111,7 +111,11 @@ where
     E::EventType: From<crate::renderer::types::Event>,
     F: FnMut(E::EventType) + 'static,
 {
+    #[cfg(not(erase_components))]
     type Output = <Self as AddAnyAttr>::Output<On<E, F>>;
+    #[cfg(erase_components)]
+    type Output =
+        <Self as AddAnyAttr>::Output<On<E, Box<dyn FnMut(E::EventType)>>>;
 
     fn on(self, event: E, cb: F) -> Self::Output {
         self.add_any_attr(on(event, cb))
@@ -203,6 +207,14 @@ where
         value: V,
     ) -> <Self as AddAnyAttr>::Output<Attr<Enterkeyhint, V>> {
         self.add_any_attr(enterkeyhint(value))
+    }
+
+    /// The `exportparts` attribute enables the sharing of parts of an element's shadow DOM with a containing document.
+    fn exportparts(
+        self,
+        value: V,
+    ) -> <Self as AddAnyAttr>::Output<Attr<Exportparts, V>> {
+        self.add_any_attr(exportparts(value))
     }
 
     /// The `hidden` global attribute is a Boolean attribute indicating that the element is not yet, or is no longer, relevant.

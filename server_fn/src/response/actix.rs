@@ -1,14 +1,14 @@
 use super::{Res, TryRes};
 use crate::error::{
-    FromServerFnError, ServerFnErrorWrapper, SERVER_FN_ERROR_HEADER,
+    FromServerFnError, SERVER_FN_ERROR_HEADER, ServerFnErrorResponseParts,
+    ServerFnErrorWrapper,
 };
 use actix_web::{
-    http::{
-        header,
-        header::{HeaderValue, LOCATION},
-        StatusCode,
-    },
     HttpResponse,
+    http::{
+        StatusCode, header,
+        header::{CONTENT_TYPE, HeaderValue, LOCATION},
+    },
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -58,23 +58,29 @@ where
 
     fn try_from_stream(
         content_type: &str,
-        data: impl Stream<Item = Result<Bytes, E>> + 'static,
+        data: impl Stream<Item = Result<Bytes, Bytes>> + 'static,
     ) -> Result<Self, E> {
         let mut builder = HttpResponse::build(StatusCode::OK);
         Ok(ActixResponse(SendWrapper::new(
             builder
                 .insert_header((header::CONTENT_TYPE, content_type))
-                .streaming(data.map(|data| data.map_err(ServerFnErrorWrapper))),
+                .streaming(data.map(|data| {
+                    data.map_err(|e| ServerFnErrorWrapper(E::de(e)))
+                })),
         )))
     }
 }
 
 impl Res for ActixResponse {
-    fn error_response(path: &str, err: String) -> Self {
+    fn error_response(path: &str, err: ServerFnErrorResponseParts) -> Self {
         ActixResponse(SendWrapper::new(
-            HttpResponse::build(StatusCode::INTERNAL_SERVER_ERROR)
-                .append_header((SERVER_FN_ERROR_HEADER, path))
-                .body(err),
+            HttpResponse::build(
+                StatusCode::from_u16(err.status_code.as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            )
+            .append_header((SERVER_FN_ERROR_HEADER, path))
+            .append_header((CONTENT_TYPE, err.content_type))
+            .body(err.body),
         ))
     }
 

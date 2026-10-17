@@ -1,6 +1,6 @@
 use crate::fixtures::{check, world::AppWorld};
 use anyhow::{Ok, Result};
-use cucumber::{then, gherkin::Step};
+use cucumber::{gherkin::Step, then, when};
 
 #[then(regex = r"^I see the page title is (.*)$")]
 async fn i_see_the_page_title_is(
@@ -80,6 +80,17 @@ async fn i_see_the_second_count_is(
     Ok(())
 }
 
+#[when(regex = r"^I see the inspect result for field (.*)$")]
+async fn i_see_the_inspect_result_for_field(
+    world: &mut AppWorld,
+    field: String,
+) -> Result<()> {
+    let client = &world.client;
+    check::inspect_result_for_field_is_visible(client, &field).await?;
+
+    Ok(())
+}
+
 #[then(regex = r"^I see the (.*) link being bolded$")]
 async fn i_see_the_link_being_bolded(
     world: &mut AppWorld,
@@ -141,7 +152,8 @@ async fn i_see_the_following_counters_under_section(
     // FIXME ideally check the mode; for now leave it because effort
     let client = &world.client;
     if let Some(table) = step.table.as_ref() {
-        let expected = table.rows
+        let expected = table
+            .rows
             .iter()
             .skip(1)
             .map(|row| (row[0].as_str(), row[1].parse::<u32>().unwrap()))

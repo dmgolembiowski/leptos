@@ -47,7 +47,7 @@ pub fn Stories() -> impl IntoView {
     let stories = Resource::new(
         move || (page(), story_type()),
         move |(page, story_type)| async move {
-            fetch_stories(category(&story_type), page).await.ok()
+            fetch_stories(story_type, page).await.ok()
         },
     );
     let (pending, set_pending) = signal(false);
@@ -143,8 +143,10 @@ fn Story(story: api::Story) -> impl IntoView {
                 {if story.story_type != "job" {
                     Either::Left(view! {
                         <span>
-                            {"by "}
-                            {story.user.map(|user| view ! {  <A href=format!("/users/{user}")>{user.clone()}</A>})}
+                            "by "
+                            <ShowLet some=story.user let:user>
+                                <A href=format!("/users/{user}")>{user.clone()}</A>
+                            </ShowLet>
                             {format!(" {} | ", story.time_ago)}
                             <A href=format!("/stories/{}", story.id)>
                                 {if story.comments_count.unwrap_or_default() > 0 {

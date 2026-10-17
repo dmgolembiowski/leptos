@@ -1,9 +1,12 @@
 use super::{
-    add_attr::AddAnyAttr, MarkBranch, Mountable, Position, PositionState,
-    Render, RenderHtml,
+    MarkBranch, Mountable, Position, PositionState, Render, RenderFlags,
+    RenderHtml, add_attr::AddAnyAttr,
 };
 use crate::{
-    html::attribute::{any_attribute::AnyAttribute, Attribute, NextAttribute},
+    html::attribute::{
+        Attribute, NamedAttributeKey, NextAttribute,
+        any_attribute::AnyAttribute,
+    },
     hydration::Cursor,
     ssr::StreamBuilder,
 };
@@ -264,6 +267,13 @@ where
             Either::Right(right) => Either::Right(right.resolve().await),
         }
     }
+
+    fn keys(&self) -> Vec<NamedAttributeKey> {
+        match self {
+            Either::Left(left) => left.keys(),
+            Either::Right(right) => right.keys(),
+        }
+    }
 }
 
 impl<A, B> RenderHtml for Either<A, B>
@@ -302,39 +312,32 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         match self {
             Either::Left(left) => {
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.open_branch("0");
                 }
-                left.to_html_with_buf(
-                    buf,
-                    position,
-                    escape,
-                    mark_branches,
-                    extra_attrs,
-                );
-                if mark_branches {
+                left.to_html_with_buf(buf, position, flags, extra_attrs);
+                if flags.mark_branches && flags.escape {
                     buf.close_branch("0");
+                    if *position == Position::NextChildAfterText {
+                        *position = Position::NextChild;
+                    }
                 }
             }
             Either::Right(right) => {
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.open_branch("1");
                 }
-                right.to_html_with_buf(
-                    buf,
-                    position,
-                    escape,
-                    mark_branches,
-                    extra_attrs,
-                );
-                if mark_branches {
+                right.to_html_with_buf(buf, position, flags, extra_attrs);
+                if flags.mark_branches && flags.escape {
                     buf.close_branch("1");
+                    if *position == Position::NextChildAfterText {
+                        *position = Position::NextChild;
+                    }
                 }
             }
         }
@@ -344,41 +347,44 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
     {
         match self {
             Either::Left(left) => {
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.open_branch("0");
                 }
                 left.to_html_async_with_buf::<OUT_OF_ORDER>(
                     buf,
                     position,
-                    escape,
-                    mark_branches,
+                    flags,
                     extra_attrs,
                 );
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.close_branch("0");
+                    if *position == Position::NextChildAfterText {
+                        *position = Position::NextChild;
+                    }
                 }
             }
             Either::Right(right) => {
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.open_branch("1");
                 }
                 right.to_html_async_with_buf::<OUT_OF_ORDER>(
                     buf,
                     position,
-                    escape,
-                    mark_branches,
+                    flags,
                     extra_attrs,
                 );
-                if mark_branches {
+                if flags.mark_branches && flags.escape {
                     buf.close_branch("1");
+                    if *position == Position::NextChildAfterText {
+                        *position = Position::NextChild;
+                    }
                 }
             }
         }
@@ -389,14 +395,33 @@ where
         cursor: &Cursor,
         position: &PositionState,
     ) -> Self::State {
-        match self {
+        let state = match self {
             Either::Left(left) => {
                 Either::Left(left.hydrate::<FROM_SERVER>(cursor, position))
             }
             Either::Right(right) => {
                 Either::Right(right.hydrate::<FROM_SERVER>(cursor, position))
             }
-        }
+        };
+        super::close_branch_marker(position);
+        state
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let state = match self {
+            Either::Left(left) => {
+                Either::Left(left.hydrate_async(cursor, position).await)
+            }
+            Either::Right(right) => {
+                Either::Right(right.hydrate_async(cursor, position).await)
+            }
+        };
+        super::close_branch_marker(position);
+        state
     }
 
     fn into_owned(self) -> Self::Owned {
@@ -546,30 +571,17 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         if self.show_b {
             self.b
                 .expect("rendering B to HTML without filling it")
-                .to_html_with_buf(
-                    buf,
-                    position,
-                    escape,
-                    mark_branches,
-                    extra_attrs,
-                );
+                .to_html_with_buf(buf, position, flags, extra_attrs);
         } else {
             self.a
                 .expect("rendering A to HTML without filling it")
-                .to_html_with_buf(
-                    buf,
-                    position,
-                    escape,
-                    mark_branches,
-                    extra_attrs,
-                );
+                .to_html_with_buf(buf, position, flags, extra_attrs);
         }
     }
 
@@ -577,8 +589,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -589,8 +600,7 @@ where
                 .to_html_async_with_buf::<OUT_OF_ORDER>(
                     buf,
                     position,
-                    escape,
-                    mark_branches,
+                    flags,
                     extra_attrs,
                 );
         } else {
@@ -599,8 +609,7 @@ where
                 .to_html_async_with_buf::<OUT_OF_ORDER>(
                     buf,
                     position,
-                    escape,
-                    mark_branches,
+                    flags,
                     extra_attrs,
                 );
         }
@@ -626,6 +635,34 @@ where
                 b.build()
             }
         });
+
+        EitherKeepAliveState { showing_b, a, b }
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let showing_b = self.show_b;
+        let a = if let Some(a) = self.a {
+            Some(if showing_b {
+                a.build()
+            } else {
+                a.hydrate_async(cursor, position).await
+            })
+        } else {
+            None
+        };
+        let b = if let Some(b) = self.b {
+            Some(if showing_b {
+                b.hydrate_async(cursor, position).await
+            } else {
+                b.build()
+            })
+        } else {
+            None
+        };
 
         EitherKeepAliveState { showing_b, a, b }
     }
@@ -843,18 +880,20 @@ macro_rules! tuples {
                     self,
                     buf: &mut String,
                     position: &mut Position,
-                    escape: bool,
-                    mark_branches: bool,
+                    flags: RenderFlags,
                     extra_attrs: Vec<AnyAttribute>
                 ) {
                     match self {
                         $([<EitherOf $num>]::$ty(this) => {
-                            if mark_branches {
+                            if flags.mark_branches && flags.escape {
                                 buf.open_branch(stringify!($ty));
                             }
-                            this.to_html_with_buf(buf, position, escape, mark_branches, extra_attrs);
-                            if mark_branches {
+                            this.to_html_with_buf(buf, position, flags, extra_attrs);
+                            if flags.mark_branches && flags.escape {
                                 buf.close_branch(stringify!($ty));
+                                if *position == Position::NextChildAfterText {
+                                    *position = Position::NextChild;
+                                }
                             }
                         })*
                     }
@@ -864,20 +903,22 @@ macro_rules! tuples {
                     self,
                     buf: &mut StreamBuilder,
                     position: &mut Position,
-                    escape: bool,
-                    mark_branches: bool,
+                    flags: RenderFlags,
                     extra_attrs: Vec<AnyAttribute>
                 ) where
                     Self: Sized,
                 {
                     match self {
                         $([<EitherOf $num>]::$ty(this) => {
-                            if mark_branches {
+                            if flags.mark_branches && flags.escape {
                                 buf.open_branch(stringify!($ty));
                             }
-                            this.to_html_async_with_buf::<OUT_OF_ORDER>(buf, position, escape, mark_branches, extra_attrs);
-                            if mark_branches {
+                            this.to_html_async_with_buf::<OUT_OF_ORDER>(buf, position, flags, extra_attrs);
+                            if flags.mark_branches && flags.escape {
                                 buf.close_branch(stringify!($ty));
+                                if *position == Position::NextChildAfterText {
+                                    *position = Position::NextChild;
+                                }
                             }
                         })*
                     }
@@ -893,6 +934,22 @@ macro_rules! tuples {
                             [<EitherOf $num>]::$ty(this.hydrate::<FROM_SERVER>(cursor, position))
                         })*
                     };
+                    $crate::view::close_branch_marker(position);
+
+                    Self::State { state }
+                }
+
+                async fn hydrate_async(
+                    self,
+                    cursor: &Cursor,
+                    position: &PositionState,
+                ) -> Self::State {
+                    let state = match self {
+                        $([<EitherOf $num>]::$ty(this) => {
+                            [<EitherOf $num>]::$ty(this.hydrate_async(cursor, position).await)
+                        })*
+                    };
+                    $crate::view::close_branch_marker(position);
 
                     Self::State { state }
                 }

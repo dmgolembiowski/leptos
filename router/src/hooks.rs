@@ -131,14 +131,14 @@ where
 
         if !IS_NAVIGATING.load(Ordering::Relaxed) {
             IS_NAVIGATING.store(true, Ordering::Relaxed);
-            request_animation_frame({
+            _ = request_animation_frame({
                 let navigate = navigate.clone();
                 let nav_options = nav_options.clone();
                 move || {
                     navigate(&new_url, nav_options.clone());
                     IS_NAVIGATING.store(false, Ordering::Relaxed)
                 }
-            })
+            });
         }
     });
 
@@ -240,7 +240,7 @@ pub(crate) struct Matched(pub ArcMemo<String>);
 #[track_caller]
 pub(crate) fn use_resolved_path(
     path: impl Fn() -> String + Send + Sync + 'static,
-) -> ArcMemo<Option<String>> {
+) -> ArcMemo<String> {
     let router = use_context::<RouterContext>()
         .expect("called use_resolved_path outside a <Router>");
     // TODO make this work with flat routes too?
@@ -248,14 +248,14 @@ pub(crate) fn use_resolved_path(
     ArcMemo::new(move |_| {
         let path = path();
         if path.starts_with('/') {
-            Some(path)
+            path
         } else {
             router
                 .resolve_path(
                     &path,
                     matched.as_ref().map(|n| n.get()).as_deref(),
                 )
-                .map(|n| n.to_string())
+                .to_string()
         }
     })
 }

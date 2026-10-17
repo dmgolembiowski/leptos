@@ -1,7 +1,9 @@
 use crate::{
-    codec::Post, error::ServerFnErrorErr, ContentType, Decodes, Encodes,
+    ContentType, Decodes, Encodes, Format, FormatType,
+    codec::{Patch, Post, Put},
+    error::ServerFnErrorErr,
 };
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use serde_lite::{Deserialize, Serialize};
 
 /// Pass arguments and receive responses as JSON in the body of a `POST` request.
@@ -11,13 +13,17 @@ impl ContentType for SerdeLiteEncoding {
     const CONTENT_TYPE: &'static str = "application/json";
 }
 
+impl FormatType for SerdeLiteEncoding {
+    const FORMAT_TYPE: Format = Format::Text;
+}
+
 impl<T> Encodes<T> for SerdeLiteEncoding
 where
     T: Serialize,
 {
     type Error = ServerFnErrorErr;
 
-    fn encode(value: T) -> Result<Bytes, Self::Error> {
+    fn encode(value: &T) -> Result<Bytes, Self::Error> {
         serde_json::to_vec(
             &value
                 .serialize()
@@ -25,6 +31,14 @@ where
         )
         .map_err(|e| ServerFnErrorErr::Serialization(e.to_string()))
         .map(Bytes::from)
+    }
+
+    fn encode_into(value: &T, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        let intermediate = value
+            .serialize()
+            .map_err(|e| ServerFnErrorErr::Serialization(e.to_string()))?;
+        serde_json::to_writer(buf.writer(), &intermediate)
+            .map_err(|e| ServerFnErrorErr::Serialization(e.to_string()))
     }
 }
 
@@ -46,3 +60,13 @@ where
 
 /// Pass arguments and receive responses as JSON in the body of a `POST` request.
 pub type SerdeLite = Post<SerdeLiteEncoding>;
+
+/// Pass arguments and receive responses as JSON in the body of a `PATCH` request.
+/// **Note**: Browser support for `PATCH` requests without JS/WASM may be poor.
+/// Consider using a `POST` request if functionality without JS/WASM is required.
+pub type PatchSerdeLite = Patch<SerdeLiteEncoding>;
+
+/// Pass arguments and receive responses as JSON in the body of a `PUT` request.
+/// **Note**: Browser support for `PUT` requests without JS/WASM may be poor.
+/// Consider using a `POST` request if functionality without JS/WASM is required.
+pub type PutSerdeLite = Put<SerdeLiteEncoding>;

@@ -4,12 +4,12 @@ use crate::hydration::set_currently_hydrating;
 use crate::view::any_view::AnyView;
 use crate::{
     html::attribute::Attribute,
-    hydration::{failed_to_cast_element, Cursor},
+    hydration::{Cursor, failed_to_cast_element},
     renderer::{CastFrom, Rndr},
     ssr::StreamBuilder,
     view::{
-        add_attr::AddAnyAttr, IntoRender, Mountable, Position, PositionState,
-        Render, RenderHtml, ToTemplate,
+        IntoRender, Mountable, Position, PositionState, Render, RenderFlags,
+        RenderHtml, ToTemplate, add_attr::AddAnyAttr,
     },
 };
 use const_str_slice_concat::{
@@ -23,7 +23,7 @@ mod element_ext;
 mod elements;
 mod inner_html;
 use super::attribute::{
-    any_attribute::AnyAttribute, escape_attr, NextAttribute,
+    NextAttribute, any_attribute::AnyAttribute, escape_attr,
 };
 pub use custom::*;
 pub use element_ext::*;
@@ -77,7 +77,6 @@ where
     E: ElementWithChildren,
     Ch: RenderHtml + next_tuple::NextTuple,
     <Ch as next_tuple::NextTuple>::Output<NewChild::Output>: Render,
-
     NewChild: IntoRender,
     NewChild::Output: RenderHtml,
 {
@@ -103,7 +102,6 @@ impl<E, At, Ch, NewChild> ElementChild<NewChild> for HtmlElement<E, At, Ch>
 where
     E: ElementWithChildren,
     Ch: RenderHtml + NextChildren,
-
     NewChild: IntoRender,
     NewChild::Output: RenderHtml,
 {
@@ -286,6 +284,8 @@ pub trait ElementType: Send + 'static {
     /// like `<style>` and `<script>`, which include other languages that should not use HTML
     /// entity escaping.
     const ESCAPE_CHILDREN: bool;
+    /// Whether the element's children should be hydrated (walked as DOM nodes on the client).
+    const HYDRATES_CHILDREN: bool = Self::ESCAPE_CHILDREN;
     /// The element's namespace, if it is not HTML.
     const NAMESPACE: Option<&'static str>;
 
@@ -317,6 +317,26 @@ where
     type State = ElementState<At::State, Ch::State>;
 
     fn rebuild(self, state: &mut Self::State) {
+        // check whether the tag is the same, for custom elements
+        // because this is const `false` for all other element types,
+        // the compiler should be able to optimize it out
+        if E::TAG.is_empty() {
+            // see https://github.com/leptos-rs/leptos/issues/4412
+            let new_tag = self.tag.tag();
+
+            // this is not particularly efficient, but it saves us from
+            // having to keep track of the tag name for every element state
+            let old_tag = state.el.tag_name();
+            if new_tag != old_tag {
+                let mut new_state = self.build();
+                state.insert_before_this(&mut new_state);
+                state.unmount();
+                *state = new_state;
+                return;
+            }
+        }
+
+        // rebuild attributes and children for any element
         let ElementState {
             attrs, children, ..
         } = state;
@@ -330,6 +350,7 @@ where
         let el = Rndr::create_element(self.tag.tag(), E::NAMESPACE);
 
         let attrs = self.attributes.build(&el);
+
         let children = if E::SELF_CLOSING {
             None
         } else {
@@ -337,6 +358,7 @@ where
             children.mount(&el, None);
             Some(children)
         };
+
         ElementState {
             el,
             attrs,
@@ -403,8 +425,7 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        _escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attributes: Vec<AnyAttribute>,
     ) {
         // opening tag
@@ -425,8 +446,9 @@ where
                 self.children.to_html_with_buf(
                     buf,
                     position,
-                    E::ESCAPE_CHILDREN,
-                    mark_branches,
+                    flags
+                        .with_escape(E::ESCAPE_CHILDREN)
+                        .with_hydrate(E::HYDRATES_CHILDREN),
                     vec![],
                 );
             }
@@ -443,8 +465,7 @@ where
         self,
         buffer: &mut StreamBuilder,
         position: &mut Position,
-        _escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attributes: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -469,8 +490,9 @@ where
                 self.children.to_html_async_with_buf::<OUT_OF_ORDER>(
                     buffer,
                     position,
-                    E::ESCAPE_CHILDREN,
-                    mark_branches,
+                    flags
+                        .with_escape(E::ESCAPE_CHILDREN)
+                        .with_hydrate(E::HYDRATES_CHILDREN),
                     vec![],
                 );
             }
@@ -531,11 +553,82 @@ where
         let attrs = self.attributes.hydrate::<FROM_SERVER>(&el);
 
         // hydrate children
-        let children = if !Ch::EXISTS || !E::ESCAPE_CHILDREN {
+        let children = if !Ch::EXISTS || !E::HYDRATES_CHILDREN {
             None
         } else {
             position.set(Position::FirstChild);
             Some(self.children.hydrate::<FROM_SERVER>(cursor, position))
+        };
+
+        // codegen optimisation:
+        fn inner_2(
+            cursor: &Cursor,
+            position: &PositionState,
+            el: &crate::renderer::types::Element,
+        ) {
+            // go to next sibling
+            cursor.set(
+                <crate::renderer::types::Element as AsRef<
+                    crate::renderer::types::Node,
+                >>::as_ref(el)
+                .clone(),
+            );
+            position.set(Position::NextChild);
+        }
+        inner_2(cursor, position, &el);
+
+        ElementState {
+            el,
+            attrs,
+            children,
+        }
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        // codegen optimisation:
+        fn inner_1(
+            cursor: &Cursor,
+            position: &PositionState,
+            tag_name: &str,
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            defined_at: &'static std::panic::Location<'static>,
+        ) -> crate::renderer::types::Element {
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            {
+                set_currently_hydrating(Some(defined_at));
+            }
+
+            let curr_position = position.get();
+            if curr_position == Position::FirstChild {
+                cursor.child();
+            } else if curr_position != Position::Current {
+                cursor.sibling();
+            }
+            crate::renderer::types::Element::cast_from(cursor.current())
+                .unwrap_or_else(|| {
+                    failed_to_cast_element(tag_name, cursor.current())
+                })
+        }
+        let el = inner_1(
+            cursor,
+            position,
+            E::TAG,
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            self.defined_at,
+        );
+
+        let attrs = self.attributes.hydrate::<true>(&el);
+
+        // hydrate children
+        let children = if !Ch::EXISTS || !E::HYDRATES_CHILDREN {
+            None
+        } else {
+            position.set(Position::FirstChild);
+            Some(self.children.hydrate_async(cursor, position).await)
         };
 
         // codegen optimisation:
@@ -627,7 +720,7 @@ impl<At, Ch> Deref for ElementState<At, Ch> {
 
 impl<At, Ch> Mountable for ElementState<At, Ch> {
     fn unmount(&mut self) {
-        Rndr::remove(self.el.as_ref());
+        Rndr::remove(&self.el);
     }
 
     fn mount(
@@ -635,23 +728,43 @@ impl<At, Ch> Mountable for ElementState<At, Ch> {
         parent: &crate::renderer::types::Element,
         marker: Option<&crate::renderer::types::Node>,
     ) {
-        Rndr::insert_node(parent, self.el.as_ref(), marker);
+        Rndr::insert_node(parent, &self.el, marker);
+    }
+
+    fn try_mount(
+        &mut self,
+        parent: &crate::renderer::types::Element,
+        marker: Option<&crate::renderer::types::Node>,
+    ) -> bool {
+        Rndr::try_insert_node(parent, &self.el, marker)
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {
-        if let Some(parent) = Rndr::get_parent(self.el.as_ref()) {
-            if let Some(element) =
-                crate::renderer::types::Element::cast_from(parent)
+        // codegen optimisation:
+        fn inner(
+            element: &crate::renderer::types::Element,
+            child: &mut dyn Mountable,
+        ) -> bool {
+            if let Some(parent) = Rndr::get_parent(element)
+                .and_then(crate::renderer::types::Element::cast_from)
             {
-                child.mount(&element, Some(self.el.as_ref()));
-                return true;
+                child.mount(&parent, Some(element));
+                true
+            } else {
+                false
             }
         }
-        false
+        inner(&self.el, child)
     }
 
     fn elements(&self) -> Vec<crate::renderer::types::Element> {
-        vec![self.el.clone()]
+        // codegen optimisation:
+        fn inner(
+            element: &crate::renderer::types::Element,
+        ) -> Vec<crate::renderer::types::Element> {
+            vec![element.clone()]
+        }
+        inner(&self.el)
     }
 }
 
@@ -699,7 +812,7 @@ where
 
             buf.push('<');
             buf.push_str(E::TAG);
-            <At as ToTemplate>::to_template(
+            <At as ToTemplate>::to_template_attribute(
                 buf,
                 &mut class,
                 &mut style,
@@ -745,7 +858,7 @@ where
 /*
 #[cfg(all(test, feature = "testing"))]
 mod tests {
-    #[cfg(feature = "nightly")]
+    #[cfg(all(feature = "nightly", rustc_nightly))]
     use super::RenderHtml;
     use super::{main, p, HtmlElement};
     use crate::{
@@ -782,7 +895,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "nightly")]
+    #[cfg(all(feature = "nightly", rustc_nightly))]
     #[test]
     fn html_render_allocates_appropriate_buffer() {
         use crate::view::static_types::Static;

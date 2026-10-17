@@ -6,6 +6,7 @@ mod arc_rw;
 mod arc_trigger;
 mod arc_write;
 pub mod guards;
+mod mapped;
 mod read;
 mod rw;
 mod subscriber_traits;
@@ -17,6 +18,7 @@ pub use arc_read::*;
 pub use arc_rw::*;
 pub use arc_trigger::*;
 pub use arc_write::*;
+pub use mapped::*;
 pub use read::*;
 pub use rw::*;
 pub use trigger::*;
@@ -40,11 +42,11 @@ pub use write::*;
 /// let (count, set_count) = arc_signal(0);
 ///
 /// // ✅ calling the getter clones and returns the value
-/// //    this can be `count()` on nightly
+/// //    this can also be called as `count()`
 /// assert_eq!(count.get(), 0);
 ///
 /// // ✅ calling the setter sets the value
-/// //    this can be `set_count(1)` on nightly
+/// //    this can also be called as `set_count(1)`
 /// set_count.set(1);
 /// assert_eq!(count.get(), 1);
 ///
@@ -86,11 +88,11 @@ pub fn arc_signal<T>(value: T) -> (ArcReadSignal<T>, ArcWriteSignal<T>) {
 /// let (count, set_count) = signal(0);
 ///
 /// // ✅ calling the getter clones and returns the value
-/// //    this can be `count()` on nightly
+/// //    this can also be called as `count()`
 /// assert_eq!(count.get(), 0);
 ///
 /// // ✅ calling the setter sets the value
-/// //    this can be `set_count(1)` on nightly
+/// //    this can also be called as `set_count(1)`
 /// set_count.set(1);
 /// assert_eq!(count.get(), 1);
 ///
@@ -147,11 +149,11 @@ pub fn signal_local<T: 'static>(
 /// let (count, set_count) = create_signal(0);
 ///
 /// // ✅ calling the getter clones and returns the value
-/// //    this can be `count()` on nightly
+/// //    this can also be called as `count()`
 /// assert_eq!(count.get(), 0);
 ///
 /// // ✅ calling the setter sets the value
-/// //    this can be `set_count(1)` on nightly
+/// //    this can also be called as `set_count(1)`
 /// set_count.set(1);
 /// assert_eq!(count.get(), 1);
 ///

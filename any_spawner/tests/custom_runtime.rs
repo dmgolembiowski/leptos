@@ -1,6 +1,7 @@
-#[cfg(feature = "futures-executor")]
+#![cfg(feature = "futures-executor")]
+
 use any_spawner::{CustomExecutor, Executor, PinnedFuture, PinnedLocalFuture};
-#[cfg(feature = "futures-executor")]
+
 #[test]
 fn can_create_custom_executor() {
     use futures::{
@@ -10,8 +11,8 @@ fn can_create_custom_executor() {
     use std::{
         cell::RefCell,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 

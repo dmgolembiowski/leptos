@@ -1,4 +1,4 @@
-use super::{guards::WriteGuard, ArcWriteSignal};
+use super::{ArcWriteSignal, guards::WriteGuard};
 use crate::{
     owner::{ArenaItem, FromLocal, LocalStorage, Storage, SyncStorage},
     traits::{
@@ -29,7 +29,7 @@ use std::{hash::Hash, ops::DerefMut, panic::Location, sync::Arc};
 /// > Each of these has a related `_untracked()` method, which updates the signal
 /// > without notifying subscribers. Untracked updates are not desirable in most
 /// > cases, as they cause “tearing” between the signal’s value and its observed
-/// > value. If you want a non-reactive container, used [`ArenaItem`] instead.
+/// > value. If you want a non-reactive container, use [`ArenaItem`] instead.
 ///
 /// ## Examples
 /// ```
@@ -37,7 +37,7 @@ use std::{hash::Hash, ops::DerefMut, panic::Location, sync::Arc};
 /// let (count, set_count) = signal(0);
 ///
 /// // ✅ calling the setter sets the value
-/// //    `set_count(1)` on nightly
+/// //    this can also be called as `set_count(1)`
 /// set_count.set(1);
 /// assert_eq!(count.get(), 1);
 ///
@@ -118,7 +118,7 @@ where
     #[track_caller]
     fn from(value: ArcWriteSignal<T>) -> Self {
         WriteSignal {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
             inner: ArenaItem::new_with_storage(value),
         }
@@ -132,7 +132,7 @@ where
     #[track_caller]
     fn from_local(value: ArcWriteSignal<T>) -> Self {
         WriteSignal {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
             inner: ArenaItem::new_with_storage(value),
         }

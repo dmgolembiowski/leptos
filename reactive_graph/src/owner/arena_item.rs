@@ -1,6 +1,6 @@
 use super::{
+    LocalStorage, OWNER, Storage, SyncStorage,
     arena::{Arena, NodeId},
-    LocalStorage, Storage, SyncStorage, OWNER,
 };
 use crate::traits::{Dispose, IntoInner, IsDisposed};
 use send_wrapper::SendWrapper;
@@ -53,7 +53,7 @@ where
             })
         };
         OWNER.with(|o| {
-            if let Some(owner) = &*o.borrow() {
+            if let Some(owner) = o.borrow().as_ref().and_then(|o| o.upgrade()) {
                 owner.register(node);
             }
         });

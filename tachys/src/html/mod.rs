@@ -4,13 +4,29 @@ use crate::{
     no_attrs,
     prelude::{AddAnyAttr, Mountable},
     renderer::{
-        dom::{Element, Node},
         CastFrom, Rndr,
+        dom::{Element, Node},
     },
-    view::{Position, PositionState, Render, RenderHtml},
+    view::{Position, PositionState, Render, RenderFlags, RenderHtml},
 };
 use attribute::any_attribute::AnyAttribute;
 use std::borrow::Cow;
+
+/// Diagnostic message shared by event, directive, and property `.expect()` calls.
+///
+/// When the `ssr` feature is active, tachys skips creating client-side values
+/// (event handlers, directives, properties) to avoid `SendWrapper` cross-thread
+/// panics on multithreaded servers. If these `.expect()` calls fire, it means
+/// the `ssr` feature was activated unintentionally via Cargo feature
+/// unification in a client-side (CSR or hydrate) build.
+pub(crate) const FEATURE_CONFLICT_DIAGNOSTIC: &str =
+    "Value is None because the `ssr` feature is active. When `ssr` is \
+     enabled, tachys skips creating client-side values (event handlers, \
+     directives, properties) to avoid cross-thread panics on multithreaded \
+     servers. If you are building a client-side (CSR or hydrate) target, this \
+     means the `ssr` feature is being activated unintentionally via Cargo \
+     feature unification; another dependency in your workspace is enabling \
+     it. Run `cargo tree -e features -i tachys` to identify the source.";
 
 /// Types for HTML attributes.
 pub mod attribute;
@@ -67,8 +83,7 @@ impl RenderHtml for Doctype {
         self,
         buf: &mut String,
         _position: &mut Position,
-        _escape: bool,
-        _mark_branches: bool,
+        _flags: RenderFlags,
         _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str("<!DOCTYPE ");
@@ -125,14 +140,14 @@ impl Render for InertElement {
     type State = InertElementState;
 
     fn build(self) -> Self::State {
-        let el = Rndr::create_element_from_html(&self.html);
+        let el = Rndr::create_element_from_html(self.html.clone());
         InertElementState(self.html, el)
     }
 
     fn rebuild(self, state: &mut Self::State) {
         let InertElementState(prev, el) = state;
         if &self.html != prev {
-            let mut new_el = Rndr::create_element_from_html(&self.html);
+            let mut new_el = Rndr::create_element_from_html(self.html.clone());
             el.insert_before_this(&mut new_el);
             el.unmount();
             *el = new_el;
@@ -178,8 +193,7 @@ impl RenderHtml for InertElement {
         self,
         buf: &mut String,
         position: &mut Position,
-        _escape: bool,
-        _mark_branches: bool,
+        _flags: RenderFlags,
         _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str(&self.html);

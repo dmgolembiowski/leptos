@@ -17,7 +17,7 @@ jobs:
       EXCLUDED_EXAMPLES: cargo-make
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install jq
         run: sudo apt-get install jq
       - name: Set Matrix
@@ -28,7 +28,7 @@ jobs:
           sed 's/\/$//' |
           jq -R -s -c 'split("\n")[:-1]')
           echo "Example Directories: $examples"
-          echo "matrix={\"directory\":$examples, \"erased_mode\": [false, true]}" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"directory\":$examples}" >> "$GITHUB_OUTPUT"
       - name: Print Location Info
         run: |
           echo "Workspace: ${{ github.workspace }}"

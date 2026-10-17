@@ -6,13 +6,13 @@ use server_fn::{
     client::{browser::BrowserClient, Client},
     codec::{
         Encoding, FromReq, FromRes, GetUrl, IntoReq, IntoRes, MultipartData,
-        MultipartFormData, Postcard, Rkyv, SerdeLite, StreamingText,
-        TextStream,
+        MultipartFormData, Postcard, Rkyv, RkyvEncoding, SerdeLite,
+        StreamingText, TextStream,
     },
     error::{FromServerFnError, IntoAppError, ServerFnErrorErr},
     request::{browser::BrowserRequest, ClientReq, Req},
     response::{browser::BrowserResponse, ClientRes, TryRes},
-    ContentType,
+    ContentType, Format, FormatType,
 };
 use std::future::Future;
 #[cfg(feature = "ssr")]
@@ -29,16 +29,16 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
         <!DOCTYPE html>
         <html lang="en">
             <head>
-                <meta charset="utf-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <AutoReload options=options.clone()/>
-                <HydrationScripts options/>
-                <meta name="color-scheme" content="dark light"/>
-                <link rel="shortcut icon" type="image/ico" href="/favicon.ico"/>
-                <link rel="stylesheet" id="leptos" href="/pkg/server_fns_axum.css"/>
+                <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+                <AutoReload options=options.clone() />
+                <HydrationScripts options />
+                <meta name="color-scheme" content="dark light" />
+                <link rel="shortcut icon" type="image/ico" href="/favicon.ico" />
+                <link rel="stylesheet" id="leptos" href="/pkg/server_fns_axum.css" />
             </head>
             <body>
-                <App/>
+                <App />
             </body>
         </html>
     }
@@ -51,7 +51,7 @@ pub fn App() -> impl IntoView {
             <h1>"Server Function Demo"</h1>
         </header>
         <main>
-            <HomePage/>
+            <HomePage />
         </main>
     }
 }
@@ -60,20 +60,20 @@ pub fn App() -> impl IntoView {
 pub fn HomePage() -> impl IntoView {
     view! {
         <h2>"Some Simple Server Functions"</h2>
-        <SpawnLocal/>
-        <WithAnAction/>
-        <WithActionForm/>
+        <SpawnLocal />
+        <WithAnAction />
+        <WithActionForm />
         <h2>"Custom Error Types"</h2>
-        <CustomErrorTypes/>
+        <CustomErrorTypes />
         <h2>"Alternative Encodings"</h2>
-        <ServerFnArgumentExample/>
-        <RkyvExample/>
-        <PostcardExample/>
-        <FileUpload/>
-        <FileUploadWithProgress/>
-        <FileWatcher/>
-        <CustomEncoding/>
-        <CustomClientExample/>
+        <ServerFnArgumentExample />
+        <RkyvExample />
+        <PostcardExample />
+        <FileUpload />
+        <FileUploadWithProgress />
+        <FileWatcher />
+        <CustomEncoding />
+        <CustomClientExample />
     }
 }
 
@@ -109,7 +109,7 @@ pub fn SpawnLocal() -> impl IntoView {
             " in an event listener. "
             "Clicking this button should alert with the uppercase version of the input."
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let value = input_ref.get().unwrap().value();
             spawn_local(async move {
@@ -183,12 +183,12 @@ pub fn WithAnAction() -> impl IntoView {
         Resource::new(move || action.version().get(), |_| get_rows());
 
     view! {
-        <h3>Using <code>Action::new</code></h3>
+        <h3>Using <code>ServerAction::new</code></h3>
         <p>
             "Some server functions are conceptually \"mutations,\", which change something on the server. "
             "These often work well as actions."
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let text = input_ref.get().unwrap().value();
             action.dispatch(text.into());
@@ -278,9 +278,9 @@ pub fn ServerFnArgumentExample() -> impl IntoView {
         <ul>
             <li>Specific server function <strong>paths</strong></li>
             <li>Mixing and matching input and output <strong>encodings</strong></li>
-            <li>Adding custom <strong>middleware</strong> on a per-server-fn basis</li>
+            <li>Adding custom <strong>middleware</strong>on a per-server-fn basis</li>
         </ul>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let value = input_ref.get().unwrap().value();
             spawn_local(async move {
@@ -318,8 +318,8 @@ pub fn RkyvExample() -> impl IntoView {
     let rkyv_result = Resource::new(move || input.get(), rkyv_example);
 
     view! {
-        <h3>Using <code>rkyv</code> encoding</h3>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <h3>Using <code>rkyv</code>encoding</h3>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let value = input_ref.get().unwrap().value();
             set_input.set(value);
@@ -379,12 +379,12 @@ pub fn FileUpload() -> impl IntoView {
             let form_data = FormData::new_with_form(&target).unwrap();
             upload_action.dispatch_local(form_data);
         }>
-            <input type="file" name="file_to_upload"/>
-            <input type="submit"/>
+            <input type="file" name="file_to_upload" />
+            <input type="submit" />
         </form>
         <p>
             {move || {
-                if upload_action.input_local().read().is_none() && upload_action.value().read().is_none()
+                if upload_action.input().read().is_none() && upload_action.value().read().is_none()
                 {
                     "Upload a file.".to_string()
                 } else if upload_action.pending().get() {
@@ -422,9 +422,11 @@ pub fn FileUploadWithProgress() -> impl IntoView {
     #[cfg(feature = "ssr")]
     mod progress {
         use async_broadcast::{broadcast, Receiver, Sender};
-        use dashmap::DashMap;
         use futures::Stream;
-        use once_cell::sync::Lazy;
+        use std::{
+            collections::HashMap,
+            sync::{LazyLock, RwLock},
+        };
 
         struct File {
             total: usize,
@@ -432,22 +434,31 @@ pub fn FileUploadWithProgress() -> impl IntoView {
             rx: Receiver<usize>,
         }
 
-        static FILES: Lazy<DashMap<String, File>> = Lazy::new(DashMap::new);
+        static FILES: LazyLock<RwLock<HashMap<String, File>>> =
+            LazyLock::new(|| RwLock::new(HashMap::new()));
 
         pub async fn add_chunk(filename: &str, len: usize) {
             println!("[{filename}]\tadding {len}");
-            let mut entry =
-                FILES.entry(filename.to_string()).or_insert_with(|| {
-                    println!("[{filename}]\tinserting channel");
-                    let (tx, rx) = broadcast(128);
-                    File { total: 0, tx, rx }
-                });
-            entry.total += len;
-            let new_total = entry.total;
+            let (tx, new_total) = {
+                let mut lock = FILES.write().unwrap();
+                let entry =
+                    lock.entry(filename.to_string()).or_insert_with(|| {
+                        println!("[{filename}]\tinserting channel");
+                        // NOTE: this channel capacity is set arbitrarily for this demo code.
+                        // it allows for up to exactly 1048 chunks to be sent, which sets an upper cap
+                        // on upload size (the precise details vary by client)
+                        // in a real system, you will want to create some more reasonable ways of
+                        // sending and sharing notifications
+                        //
+                        // see https://github.com/leptos-rs/leptos/issues/4397 for related discussion
+                        let (tx, rx) = broadcast(1048);
+                        File { total: 0, tx, rx }
+                    });
+                entry.total += len;
+                let new_total = entry.total;
 
-            // we're about to do an async broadcast, so we don't want to hold a lock across it
-            let tx = entry.tx.clone();
-            drop(entry);
+                (entry.tx.clone(), new_total)
+            };
 
             // now we send the message and don't have to worry about it
             tx.broadcast(new_total)
@@ -456,12 +467,12 @@ pub fn FileUploadWithProgress() -> impl IntoView {
         }
 
         pub fn for_file(filename: &str) -> impl Stream<Item = usize> {
-            let entry =
-                FILES.entry(filename.to_string()).or_insert_with(|| {
-                    println!("[{filename}]\tinserting channel");
-                    let (tx, rx) = broadcast(128);
-                    File { total: 0, tx, rx }
-                });
+            let mut lock = FILES.write().unwrap();
+            let entry = lock.entry(filename.to_string()).or_insert_with(|| {
+                println!("[{filename}]\tinserting channel");
+                let (tx, rx) = broadcast(128);
+                File { total: 0, tx, rx }
+            });
             entry.rx.clone()
         }
     }
@@ -530,7 +541,7 @@ pub fn FileUploadWithProgress() -> impl IntoView {
                 let len = len
                     .split('\n')
                     .filter(|n| !n.is_empty())
-                    .last()
+                    .next_back()
                     .expect(
                         "expected at least one non-empty value from \
                          newline-delimited rows",
@@ -552,21 +563,16 @@ pub fn FileUploadWithProgress() -> impl IntoView {
         <p>A file upload with progress can be handled with two separate server functions.</p>
         <aside>See the doc comment on the component for an explanation.</aside>
         <form on:submit=on_submit>
-            <input type="file" name="file_to_upload"/>
-            <input type="submit"/>
+            <input type="file" name="file_to_upload" />
+            <input type="submit" />
         </form>
         {move || filename.get().map(|filename| view! { <p>Uploading {filename}</p> })}
-        {move || {
-            max.get()
-                .map(|max| {
-                    view! {
-                        <progress
-                            max=max
-                            value=move || current.get().unwrap_or_default()
-                        ></progress>
-                    }
-                })
-        }}
+        <ShowLet some=max let:max>
+            <progress
+                max=max
+                value=move || current.get().unwrap_or_default()
+            ></progress>
+        </ShowLet>
     }
 }
 #[component]
@@ -683,14 +689,35 @@ pub async fn ascii_uppercase_classic(
 }
 
 // The EnumString and Display derive macros are provided by strum
-#[derive(Debug, Clone, Display, EnumString, Serialize, Deserialize)]
+#[derive(
+    thiserror::Error,
+    Debug,
+    Clone,
+    Display,
+    EnumString,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum InvalidArgument {
     TooShort,
     TooLong,
     NotAscii,
 }
 
-#[derive(Debug, Clone, Display, Serialize, Deserialize)]
+#[derive(
+    thiserror::Error,
+    Debug,
+    Clone,
+    Display,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum MyErrors {
     InvalidArgument(InvalidArgument),
     ServerFnError(ServerFnErrorErr),
@@ -710,6 +737,8 @@ impl From<String> for MyErrors {
 }
 
 impl FromServerFnError for MyErrors {
+    type Encoder = RkyvEncoding;
+
     fn from_server_fn_error(value: ServerFnErrorErr) -> Self {
         MyErrors::ServerFnError(value)
     }
@@ -730,7 +759,7 @@ pub fn CustomErrorTypes() -> impl IntoView {
             "Try typing a message that is between 5 and 15 characters of ASCII text below. Then try breaking \
             the rules!"
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let value = input_ref.get().unwrap().value();
             spawn_local(async move {
@@ -764,6 +793,10 @@ pub struct TomlEncoded<T>(T);
 
 impl ContentType for Toml {
     const CONTENT_TYPE: &'static str = "application/toml";
+}
+
+impl FormatType for Toml {
+    const FORMAT_TYPE: Format = Format::Text;
 }
 
 impl Encoding for Toml {
@@ -859,7 +892,7 @@ pub fn CustomEncoding() -> impl IntoView {
         <p>
             "This example creates a custom encoding that sends server fn data using TOML. Why? Well... why not?"
         </p>
-        <input node_ref=input_ref placeholder="Type something here."/>
+        <input node_ref=input_ref placeholder="Type something here." />
         <button on:click=move |_| {
             let value = input_ref.get().unwrap().value();
             spawn_local(async move {
@@ -885,9 +918,11 @@ pub fn CustomClientExample() -> impl IntoView {
     pub struct CustomClient;
 
     // Implement the `Client` trait for it.
-    impl<E> Client<E> for CustomClient
+    impl<E, IS, OS> Client<E, IS, OS> for CustomClient
     where
         E: FromServerFnError,
+        IS: FromServerFnError,
+        OS: FromServerFnError,
     {
         // BrowserRequest and BrowserResponse are the defaults used by other server functions.
         // They are wrappers for the underlying Web Fetch API types.
@@ -904,7 +939,7 @@ pub fn CustomClientExample() -> impl IntoView {
             // modify the headers by appending one
             headers.append("X-Custom-Header", "foobar");
             // delegate back out to BrowserClient to send the modified request
-            BrowserClient::send(req)
+            <BrowserClient as Client<E, IS, OS>>::send(req)
         }
 
         fn open_websocket(
@@ -912,17 +947,20 @@ pub fn CustomClientExample() -> impl IntoView {
         ) -> impl Future<
             Output = Result<
                 (
-                    impl Stream<Item = Result<server_fn::Bytes, E>> + Send + 'static,
-                    impl Sink<Result<server_fn::Bytes, E>> + Send + 'static,
+                    impl Stream<
+                            Item = Result<server_fn::Bytes, server_fn::Bytes>,
+                        > + Send
+                        + 'static,
+                    impl Sink<server_fn::Bytes> + Send + 'static,
                 ),
                 E,
             >,
         > + Send {
-            BrowserClient::open_websocket(path)
+            <BrowserClient as Client<E, IS, OS>>::open_websocket(path)
         }
 
         fn spawn(future: impl Future<Output = ()> + Send + 'static) {
-            <BrowserClient as Client<E>>::spawn(future)
+            <BrowserClient as Client<E, IS, OS>>::spawn(future)
         }
     }
 
@@ -996,16 +1034,14 @@ pub fn PostcardExample() -> impl IntoView {
     );
 
     view! {
-        <h3>Using <code>postcard</code> encoding</h3>
+        <h3>Using <code>postcard</code>encoding</h3>
         <p>"This example demonstrates using Postcard for efficient binary serialization."</p>
         <button on:click=move |_| {
-            // Update the input data when the button is clicked
-            set_input.update(|data| {
-                data.age += 1;
-            });
-        }>
-            "Increment Age"
-        </button>
+            set_input
+                .update(|data| {
+                    data.age += 1;
+                });
+        }>"Increment Age"</button>
         // Display the current input data
         <p>"Input: " {move || format!("{:?}", input.get())}</p>
         <Transition>

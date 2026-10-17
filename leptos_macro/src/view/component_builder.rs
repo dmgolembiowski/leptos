@@ -1,8 +1,9 @@
 use super::{
-    fragment_to_tokens, utils::is_nostrip_optional_and_update_key, TagType,
+    TagType, fragment_to_tokens, utils::is_nostrip_optional_and_update_key,
 };
-use crate::view::{
-    attribute_absolute, text_to_tokens, utils::filter_prefixed_attrs,
+use crate::{
+    diagnostics::Errors,
+    view::{attribute_absolute, text_to_tokens, utils::filter_prefixed_attrs},
 };
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use quote::{format_ident, quote, quote_spanned};
@@ -12,17 +13,18 @@ use rstml::node::{
 };
 use std::collections::HashMap;
 use syn::{
-    spanned::Spanned, Expr, ExprPath, ExprRange, Item, RangeLimits, Stmt,
+    Expr, ExprPath, ExprRange, Item, RangeLimits, Stmt, spanned::Spanned,
 };
 
 pub(crate) fn component_to_tokens(
     node: &mut NodeElement<impl CustomNode>,
     global_class: Option<&TokenTree>,
     disable_inert_html: bool,
-) -> TokenStream {
+    errors: &mut Errors,
+) -> syn::Result<TokenStream> {
     #[allow(unused)] // TODO this is used by hot-reloading
     #[cfg(debug_assertions)]
-    let component_name = super::ident_from_tag_name(node.name());
+    let component_name = super::ident_from_tag_name(node.name(), errors);
 
     // an attribute that contains {..} can be used to split props from attributes
     // anything before it is a prop, unless it uses the special attribute syntaxes
@@ -90,7 +92,7 @@ pub(crate) fn component_to_tokens(
 
         if optional {
             optional_props.push(quote! {
-                props.#name = { #value }.map(Into::into);
+                props.#name = { #value }.map(::leptos::prelude::IntoReactiveValue::into_reactive_value);
             })
         } else {
             required_props.push(quote! {
@@ -111,16 +113,14 @@ pub(crate) fn component_to_tokens(
 
             let KeyedAttributeValue::Binding(binding) = &attr.possible_value
             else {
-                if let Some(ident) = attr.key.to_string().strip_prefix("let:") {
-                    let span = match &attr.key {
-                        NodeName::Punctuated(path) => path[1].span(),
-                        _ => unreachable!(),
-                    };
-                    let ident1 = format_ident!("{ident}", span = span);
-                    return Some(quote_spanned! { span => #ident1 });
-                } else {
-                    return None;
-                }
+                let ident = attr.key.to_string();
+                let ident = ident.strip_prefix("let:")?;
+                let span = match &attr.key {
+                    NodeName::Punctuated(path) => path[1].span(),
+                    _ => unreachable!(),
+                };
+                let ident1 = format_ident!("{ident}", span = span);
+                return Some(quote_spanned! { span => #ident1 });
             };
 
             let inputs = &binding.inputs;
@@ -160,23 +160,25 @@ pub(crate) fn component_to_tokens(
                 } else {
                     None
                 };
-                Some(dotted.unwrap_or_else(|| {
+                Some(Ok(dotted.unwrap_or_else(|| {
                     quote! {
                         #node
                     }
-                }))
+                })))
             } else if let NodeAttribute::Attribute(node) = attr {
-                attribute_absolute(node, idx >= spread_marker)
+                attribute_absolute(node, idx >= spread_marker).transpose()
             } else {
                 None
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<syn::Result<Vec<_>>>()?;
 
     let spreads = (!(spreads.is_empty())).then(|| {
         if cfg!(feature = "__internal_erase_components") {
             quote! {
-                .add_any_attr(vec![#(#spreads.into_any_attr(),)*])
+                .add_any_attr({
+                    vec![#(::leptos::attr::any_attribute::IntoAnyAttribute::into_any_attr(#spreads),)*]
+                })
             }
         } else {
             quote! {
@@ -215,7 +217,8 @@ pub(crate) fn component_to_tokens(
             global_class,
             None,
             disable_inert_html,
-        );
+            errors,
+        )?;
 
         // TODO view marker for hot-reloading
         /*
@@ -286,6 +289,10 @@ pub(crate) fn component_to_tokens(
     };
 
     let name = node.name();
+    // Span `.build()` to the component name so that TypedBuilder's
+    // "missing required field" error (raised on `build`) points at this
+    // specific `<Component/>` instead of at the whole `view!` invocation.
+    let build = quote_spanned! { name.span() => .build() };
     #[allow(unused_mut)] // used in debug
     let mut component = quote! {
         {
@@ -300,7 +307,7 @@ pub(crate) fn component_to_tokens(
                         #(#required_props)*
                         #(#slots)*
                         #children
-                        .build();
+                        #build;
                     #(#optional_props)*
                     props
                 }
@@ -314,7 +321,7 @@ pub(crate) fn component_to_tokens(
     /* #[cfg(debug_assertions)]
     IdeTagHelper::add_component_completion(&mut component, node); */
 
-    component
+    Ok(component)
 }
 
 fn is_attr_let(key: &NodeName) -> bool {
@@ -327,9 +334,9 @@ fn is_attr_let(key: &NodeName) -> bool {
     }
 }
 
-pub fn items_to_clone_to_tokens<'a>(
-    items_to_clone: &'a [Ident],
-) -> impl Iterator<Item = TokenStream> + 'a {
+pub fn items_to_clone_to_tokens(
+    items_to_clone: &[Ident],
+) -> impl Iterator<Item = TokenStream> + '_ {
     items_to_clone.iter().map(|ident| {
         let ident_ref = quote_spanned!(ident.span()=> &#ident);
         quote! { let #ident = ::core::clone::Clone::clone(#ident_ref); }
@@ -354,7 +361,8 @@ pub fn maybe_optimised_component_children(
         .iter()
         .filter(|child| !matches!(child, Node::Comment(_)));
 
-    let children = if let Some(child) = children_iter.next() {
+    let children = {
+        let child = children_iter.next()?;
         // If more than one child after filtering out comments, don't think we can optimise:
         if children_iter.next().is_some() {
             return None;
@@ -380,29 +388,18 @@ pub fn maybe_optimised_component_children(
                     return None;
                 } else if let Some(stmt) = block.stmts.first() {
                     match stmt {
-                        Stmt::Macro(mac) => {
-                            // eprintln!("Macro: {:?}", mac.mac.path);
-                            if is_supported(&mac.mac) {
-                                quote! { #block }
-                            } else {
-                                return None;
-                            }
+                        Stmt::Macro(mac) if is_supported(&mac.mac) => {
+                            quote! { #block }
                         }
-                        Stmt::Item(Item::Macro(mac)) => {
-                            // eprintln!("Item Macro: {:?}", mac.mac.path);
-                            if is_supported(&mac.mac) {
-                                quote! { #block }
-                            } else {
-                                return None;
-                            }
+                        Stmt::Item(Item::Macro(mac))
+                            if is_supported(&mac.mac) =>
+                        {
+                            quote! { #block }
                         }
-                        Stmt::Expr(Expr::Macro(mac), _) => {
-                            // eprintln!("Expr Macro: {:?}", mac.mac.path);
-                            if is_supported(&mac.mac) {
-                                quote! { #block }
-                            } else {
-                                return None;
-                            }
+                        Stmt::Expr(Expr::Macro(mac), _)
+                            if is_supported(&mac.mac) =>
+                        {
+                            quote! { #block }
                         }
                         _ => return None,
                     }
@@ -412,8 +409,6 @@ pub fn maybe_optimised_component_children(
             }
             _ => return None,
         }
-    } else {
-        return None;
     };
 
     // // Debug check to see how many use this optimisation:

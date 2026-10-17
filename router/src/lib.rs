@@ -105,7 +105,7 @@
 //!     move || params.read().get("id").unwrap_or_default(),
 //!     move |id| contact_data(id)
 //!   );
-//!   todo!()
+//!   // ... return some view
 //! }
 //! ```
 //!
@@ -121,8 +121,6 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-#![cfg_attr(feature = "nightly", feature(auto_traits))]
-#![cfg_attr(feature = "nightly", feature(negative_impls))]
 
 /// Components for route definition and for enhanced links and forms.
 pub mod components;
@@ -148,7 +146,7 @@ pub mod static_routes;
 
 pub use generate_route_list::*;
 #[doc(inline)]
-pub use leptos_router_macro::path;
+pub use leptos_router_macro::{lazy_route, path};
 pub use matching::*;
 pub use method::*;
 pub use navigate::*;
@@ -157,7 +155,7 @@ pub use ssr_mode::*;
 pub(crate) mod view_transition {
     use js_sys::{Function, Promise, Reflect};
     use leptos::leptos_dom::helpers::document;
-    use wasm_bindgen::{closure::Closure, intern, JsCast, JsValue};
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure, intern};
 
     pub fn start_view_transition(
         level: u8,

@@ -44,9 +44,11 @@
 
 use futures::{Stream, StreamExt};
 use leptos::{
-    attr::{any_attribute::AnyAttribute, NextAttribute},
+    IntoView,
+    attr::{NextAttribute, any_attribute::AnyAttribute},
     component,
     logging::debug_warn,
+    nonce::use_nonce,
     oco::Oco,
     reactive::owner::{provide_context, use_context},
     tachys::{
@@ -57,19 +59,17 @@ use leptos::{
         },
         hydration::Cursor,
         view::{
-            add_attr::AddAnyAttr, Mountable, Position, PositionState, Render,
-            RenderHtml,
+            Mountable, Position, PositionState, Render, RenderFlags,
+            RenderHtml, add_attr::AddAnyAttr,
         },
     },
-    IntoView,
 };
-use once_cell::sync::Lazy;
 use send_wrapper::SendWrapper;
 use std::{
     fmt::Debug,
     sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc,
+        Arc, LazyLock,
+        mpsc::{Receiver, Sender, channel},
     },
 };
 use wasm_bindgen::JsCast;
@@ -101,7 +101,7 @@ pub struct MetaContext {
     /// Metadata associated with the `<title>` element.
     pub(crate) title: TitleContext,
     /// The hydration cursor for the location in the `<head>` for arbitrary tags will be rendered.
-    pub(crate) cursor: Arc<Lazy<SendWrapper<Cursor>>>,
+    pub(crate) cursor: Arc<LazyLock<SendWrapper<Cursor>>>,
 }
 
 impl MetaContext {
@@ -143,7 +143,7 @@ impl Default for MetaContext {
             ))
         };
 
-        let cursor = Arc::new(Lazy::new(build_cursor));
+        let cursor = Arc::new(LazyLock::new(build_cursor));
         Self {
             title: Default::default(),
             cursor,
@@ -216,6 +216,13 @@ impl ServerMetaContextOutput {
         self,
         mut stream: impl Stream<Item = String> + Send + Unpin,
     ) -> impl Stream<Item = String> + Send {
+        // if the first chunk consists of a synchronously-available Suspend,
+        // inject_meta_context can accidentally run a tick before it, but the Suspend
+        // when both are available. waiting a tick before awaiting the first chunk
+        // in the Stream ensures that this always runs after that first chunk
+        // see https://github.com/leptos-rs/leptos/issues/3976 for the original issue
+        leptos::task::tick().await;
+
         // wait for the first chunk of the stream, to ensure our components hve run
         let mut first_chunk = stream.next().await.unwrap_or_default();
 
@@ -242,40 +249,39 @@ impl ServerMetaContextOutput {
             let head_loc = first_chunk
                 .find("</head>")
                 .expect("you are using leptos_meta without a </head> tag");
-            let marker_loc =
-                first_chunk.find("<!--HEAD-->").unwrap_or_else(|| {
+            let marker_loc = first_chunk
+                .find("<!--HEAD-->")
+                .map(|pos| pos + "<!--HEAD-->".len())
+                .unwrap_or_else(|| {
                     first_chunk.find("</head>").unwrap_or(head_loc)
                 });
             let (before_marker, after_marker) =
                 first_chunk.split_at_mut(marker_loc);
-            let (before_head_close, after_head) =
-                after_marker.split_at_mut(head_loc - marker_loc);
             buf.push_str(before_marker);
+            buf.push_str(&meta_buf);
             if let Some(title) = title {
                 buf.push_str("<title>");
                 buf.push_str(&title);
                 buf.push_str("</title>");
             }
-            buf.push_str(before_head_close);
-            buf.push_str(&meta_buf);
-            buf.push_str(after_head);
+            buf.push_str(after_marker);
             buf
         };
 
-        if !html_attrs.is_empty() {
-            if let Some(index) = modified_chunk.find("<html") {
-                // Calculate the position where the new string should be inserted
-                let insert_pos = index + "<html".len();
-                modified_chunk.insert_str(insert_pos, &html_attrs);
-            }
+        if !html_attrs.is_empty()
+            && let Some(index) = modified_chunk.find("<html")
+        {
+            // Calculate the position where the new string should be inserted
+            let insert_pos = index + "<html".len();
+            modified_chunk.insert_str(insert_pos, &html_attrs);
         }
 
-        if !body_attrs.is_empty() {
-            if let Some(index) = modified_chunk.find("<body") {
-                // Calculate the position where the new string should be inserted
-                let insert_pos = index + "<body".len();
-                modified_chunk.insert_str(insert_pos, &body_attrs);
-            }
+        if !body_attrs.is_empty()
+            && let Some(index) = modified_chunk.find("<body")
+        {
+            // Calculate the position where the new string should be inserted
+            let insert_pos = index + "<body".len();
+            modified_chunk.insert_str(insert_pos, &body_attrs);
         }
 
         futures::stream::once(async move { modified_chunk }).chain(stream)
@@ -408,6 +414,7 @@ where
     type Owned = RegisteredMetaTag<E, At::CloneableOwned, Ch::Owned>;
 
     const MIN_LENGTH: usize = 0;
+    const EXISTS: bool = false;
 
     fn dry_resolve(&mut self) {
         self.el.dry_resolve()
@@ -421,8 +428,7 @@ where
         self,
         _buf: &mut String,
         _position: &mut Position,
-        _escape: bool,
-        _mark_branches: bool,
+        _flags: RenderFlags,
         _extra_attrs: Vec<AnyAttribute>,
     ) {
         // meta tags are rendered into the buffer stored into the context
@@ -433,8 +439,7 @@ where
             self.el.to_html_with_buf(
                 &mut buf,
                 &mut Position::NextChild,
-                false,
-                false,
+                RenderFlags::new(false, false, false),
                 vec![],
             );
             _ = cx.elements.send(buf); // fails only if the receiver is already dropped
@@ -446,7 +451,7 @@ where
             tracing::warn!("{}", msg);
 
             #[cfg(not(feature = "tracing"))]
-            eprintln!("{}", msg);
+            eprintln!("{msg}");
         }
     }
 
@@ -564,8 +569,7 @@ impl RenderHtml for MetaTagsView {
         self,
         buf: &mut String,
         _position: &mut Position,
-        _escape: bool,
-        _mark_branches: bool,
+        _flags: RenderFlags,
         _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str("<!--HEAD-->");
@@ -589,18 +593,9 @@ pub(crate) trait OrDefaultNonce {
 
 impl OrDefaultNonce for Option<Oco<'static, str>> {
     fn or_default_nonce(self) -> Option<Oco<'static, str>> {
-        #[cfg(feature = "nonce")]
-        {
-            use leptos::nonce::use_nonce;
-
-            match self {
-                Some(nonce) => Some(nonce),
-                None => use_nonce().map(|n| Arc::clone(n.as_inner()).into()),
-            }
-        }
-        #[cfg(not(feature = "nonce"))]
-        {
-            self
+        match self {
+            Some(nonce) => Some(nonce),
+            None => use_nonce().map(|n| Arc::clone(n.as_inner()).into()),
         }
     }
 }

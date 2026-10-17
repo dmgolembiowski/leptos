@@ -1,6 +1,6 @@
 use crate::{
     html::attribute::any_attribute::AnyAttribute,
-    view::{Position, RenderHtml},
+    view::{Position, RenderFlags, RenderHtml},
 };
 use futures::Stream;
 use std::{
@@ -82,6 +82,10 @@ impl StreamBuilder {
 
     /// Appends another stream to this one.
     pub fn append(&mut self, mut other: StreamBuilder) {
+        if !self.sync_buf.is_empty() {
+            self.chunks
+                .push_back(StreamChunk::Sync(mem::take(&mut self.sync_buf)));
+        }
         self.chunks.append(&mut other.chunks);
         self.sync_buf.push_str(&other.sync_buf);
     }
@@ -114,8 +118,7 @@ impl StreamBuilder {
         fallback.to_html_with_buf(
             &mut self.sync_buf,
             position,
-            true,
-            mark_branches,
+            RenderFlags::HYDRATE.with_mark_branches(mark_branches),
             extra_attrs,
         );
         self.write_chunk_marker(false);
@@ -149,7 +152,7 @@ impl StreamBuilder {
             self.sync_buf.reserve(11 + (id.len() * 2));
             self.sync_buf.push_str("<!--s-");
             for piece in id {
-                write!(&mut self.sync_buf, "{}-", piece).unwrap();
+                write!(&mut self.sync_buf, "{piece}-").unwrap();
             }
             if opening {
                 self.sync_buf.push_str("o-->");
@@ -202,27 +205,34 @@ impl StreamBuilder {
                 let mut id = String::new();
                 if let Some(ids) = &subbuilder.id {
                     for piece in ids {
-                        write!(&mut id, "{}-", piece).unwrap();
+                        write!(&mut id, "{piece}-").unwrap();
                     }
                 }
                 if let Some(id) = subbuilder.id.as_mut() {
                     id.push(0);
                 }
                 let replace = view.is_some();
-                if let Some(view) = view {
-                    view.to_html_async_with_buf::<true>(
-                        &mut subbuilder,
-                        &mut position,
-                        true,
-                        mark_branches,
-                        extra_attrs,
-                    );
-                }
+                view.to_html_async_with_buf::<true>(
+                    &mut subbuilder,
+                    &mut position,
+                    RenderFlags::HYDRATE.with_mark_branches(mark_branches),
+                    extra_attrs,
+                );
                 let chunks = subbuilder.finish().take_chunks();
+                let mut flattened_chunks =
+                    VecDeque::with_capacity(chunks.len());
+                for chunk in chunks {
+                    // this will wait for any ErrorBoundary async nodes and flatten them out
+                    if let StreamChunk::Async { chunks } = chunk {
+                        flattened_chunks.extend(chunks.await);
+                    } else {
+                        flattened_chunks.push_back(chunk);
+                    }
+                }
 
                 OooChunk {
                     id,
-                    chunks,
+                    chunks: flattened_chunks,
                     replace,
                     nonce,
                 }
@@ -319,6 +329,11 @@ impl OooChunk {
         }
         buf.push_str("})()</script>");
     }
+
+    /// Consumes this structure and returns its inner chunks of the stream.
+    pub fn take_chunks(self) -> VecDeque<StreamChunk> {
+        self.chunks
+    }
 }
 
 impl Debug for StreamChunk {
@@ -361,83 +376,113 @@ impl Stream for StreamBuilder {
             let next_chunk = this.chunks.pop_front();
             match next_chunk {
                 None => {
-                    // now, handle out-of-order chunks
-                    if let Some(mut pending) = this.pending_ooo.pop_front() {
-                        match pending.as_mut().poll(cx) {
-                            Poll::Ready(OooChunk {
-                                id,
-                                chunks,
-                                replace,
-                                nonce,
-                            }) => {
-                                let opening = format!("<!--s-{id}o-->");
-                                let placeholder_at =
-                                    this.sync_buf.find(&opening);
-                                if let Some(start) = placeholder_at {
-                                    let closing = format!("<!--s-{id}c-->");
-                                    let end =
-                                        this.sync_buf.find(&closing).unwrap();
-                                    let chunks_iter = chunks.into_iter().rev();
+                    if this.pending_ooo.is_empty() {
+                        if this.sync_buf.is_empty() {
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(mem::take(&mut this.sync_buf)))
+                        }
+                    } else {
+                        // check if *any* pending out-of-order chunk is ready
+                        for mut chunk in mem::take(&mut this.pending_ooo) {
+                            match chunk.as_mut().poll(cx) {
+                                Poll::Ready(OooChunk {
+                                    id,
+                                    chunks,
+                                    replace,
+                                    nonce,
+                                }) => {
+                                    // Build the opening marker once. The
+                                    // closing marker differs only in the
+                                    // "o"/"c" flag, so reuse the same
+                                    // allocation instead of formatting a second
+                                    // needle.
+                                    let mut marker =
+                                        String::with_capacity(10 + id.len());
+                                    marker.push_str("<!--s-");
+                                    marker.push_str(&id);
+                                    marker.push_str("o-->");
+                                    let marker_len = marker.len();
+                                    let placeholder_at =
+                                        this.sync_buf.find(&marker);
+                                    if let Some(start) = placeholder_at {
+                                        // flip "o-->" to "c-->" (the flag is 4
+                                        // bytes from the end)
+                                        marker.replace_range(
+                                            marker_len - 4..marker_len - 3,
+                                            "c",
+                                        );
+                                        // the closing marker always follows the
+                                        // opening, so only scan the tail
+                                        let end = start
+                                            + this.sync_buf[start..]
+                                                .find(&marker)
+                                                .unwrap();
 
-                                    // TODO can probably make this more efficient
-                                    let (before, replaced) =
-                                        this.sync_buf.split_at(start);
-                                    let (_, after) = replaced
-                                        .split_at(end - start + closing.len());
-                                    let mut buf = String::new();
-                                    buf.push_str(before);
+                                        // TODO can probably make this more efficient
+                                        let (before, replaced) =
+                                            this.sync_buf.split_at(start);
+                                        let (_, after) = replaced
+                                            .split_at(end - start + marker_len);
+                                        let mut buf = String::new();
+                                        buf.push_str(before);
 
-                                    let mut held_chunks = VecDeque::new();
-                                    for chunk in chunks_iter {
-                                        if let StreamChunk::Sync(ready) = chunk
-                                        {
-                                            buf.push_str(&ready);
-                                        } else {
-                                            held_chunks.push_front(chunk);
+                                        let mut held_chunks = VecDeque::new();
+                                        for chunk in chunks {
+                                            if let StreamChunk::Sync(ready) =
+                                                chunk
+                                            {
+                                                buf.push_str(&ready);
+                                            } else {
+                                                held_chunks.push_back(chunk);
+                                            }
                                         }
-                                    }
-                                    buf.push_str(after);
-                                    this.sync_buf = buf;
-                                    for chunk in held_chunks {
-                                        this.chunks.push_front(chunk);
-                                    }
-                                } else {
-                                    OooChunk::push_start(
-                                        &id,
-                                        &mut this.sync_buf,
-                                    );
-                                    for chunk in chunks.into_iter().rev() {
-                                        if let StreamChunk::Sync(ready) = chunk
+                                        buf.push_str(after);
+                                        this.sync_buf = buf;
+                                        while let Some(chunk) =
+                                            held_chunks.pop_back()
                                         {
-                                            this.sync_buf.push_str(&ready);
-                                        } else {
+                                            this.chunks.push_front(chunk);
+                                        }
+                                    } else {
+                                        OooChunk::push_start(
+                                            &id,
+                                            &mut this.sync_buf,
+                                        );
+                                        let mut held_chunks = VecDeque::new();
+                                        for chunk in chunks {
+                                            if let StreamChunk::Sync(ready) =
+                                                chunk
+                                            {
+                                                this.sync_buf.push_str(&ready);
+                                            } else {
+                                                held_chunks.push_back(chunk);
+                                            }
+                                        }
+                                        OooChunk::push_end_with_nonce(
+                                            replace,
+                                            &id,
+                                            &mut this.sync_buf,
+                                            nonce.as_deref(),
+                                        );
+                                        while let Some(chunk) =
+                                            held_chunks.pop_back()
+                                        {
                                             this.chunks.push_front(chunk);
                                         }
                                     }
-                                    OooChunk::push_end_with_nonce(
-                                        replace,
-                                        &id,
-                                        &mut this.sync_buf,
-                                        nonce.as_deref(),
-                                    );
                                 }
-                                self.poll_next(cx)
-                            }
-                            Poll::Pending => {
-                                this.pending_ooo.push_back(pending);
-                                if this.sync_buf.is_empty() {
-                                    Poll::Pending
-                                } else {
-                                    Poll::Ready(Some(mem::take(
-                                        &mut this.sync_buf,
-                                    )))
+                                Poll::Pending => {
+                                    this.pending_ooo.push_back(chunk);
                                 }
                             }
                         }
-                    } else if this.sync_buf.is_empty() {
-                        Poll::Ready(None)
-                    } else {
-                        Poll::Ready(Some(mem::take(&mut this.sync_buf)))
+
+                        if this.sync_buf.is_empty() {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(Some(mem::take(&mut this.sync_buf)))
+                        }
                     }
                 }
                 Some(StreamChunk::Sync(value)) => {

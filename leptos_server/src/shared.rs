@@ -1,15 +1,15 @@
 use crate::{FromEncodedStr, IntoEncodedString};
+#[cfg(feature = "serde-lite")]
+use codee::SerdeLite;
 #[cfg(feature = "rkyv")]
 use codee::binary::RkyvCodec;
 #[cfg(feature = "serde-wasm-bindgen")]
 use codee::string::JsonSerdeWasmCodec;
 #[cfg(feature = "miniserde")]
 use codee::string::MiniserdeCodec;
-#[cfg(feature = "serde-lite")]
-use codee::SerdeLite;
 use codee::{
-    string::{FromToStringCodec, JsonSerdeCodec},
     Decoder, Encoder,
+    string::{FromToStringCodec, JsonSerdeCodec},
 };
 use std::{
     fmt::{Debug, Display},
@@ -80,6 +80,7 @@ where
 }
 
 #[cfg(feature = "serde-lite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-lite")))]
 impl<T> SharedValue<T, SerdeLite<JsonSerdeCodec>>
 where
     SerdeLite<JsonSerdeCodec>: Encoder<T> + Decoder<T>,
@@ -102,6 +103,7 @@ where
 }
 
 #[cfg(feature = "serde-wasm-bindgen")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-wasm-bindgen")))]
 impl<T> SharedValue<T, JsonSerdeWasmCodec>
 where
     JsonSerdeWasmCodec: Encoder<T> + Decoder<T>,
@@ -124,6 +126,7 @@ where
 }
 
 #[cfg(feature = "miniserde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "miniserde")))]
 impl<T> SharedValue<T, MiniserdeCodec>
 where
     MiniserdeCodec: Encoder<T> + Decoder<T>,
@@ -146,6 +149,7 @@ where
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rkyv")))]
 impl<T> SharedValue<T, RkyvCodec>
 where
     RkyvCodec: Encoder<T> + Decoder<T>,
@@ -191,7 +195,10 @@ where
             use std::borrow::Borrow;
 
             let sc = Owner::current_shared_context();
-            let id = sc.as_ref().map(|sc| sc.next_id()).unwrap_or_default();
+            let id = sc
+                .as_ref()
+                .map(|sc| Owner::next_serialized_data_id(&**sc))
+                .unwrap_or_default();
             let serialized = sc.as_ref().and_then(|sc| sc.read_data(&id));
             let hydrating =
                 sc.as_ref().map(|sc| sc.during_hydration()).unwrap_or(false);
@@ -228,20 +235,19 @@ where
             } else {
                 let init = initial();
                 #[cfg(feature = "ssr")]
-                if let Some(sc) = sc {
-                    if sc.get_is_hydrating() {
-                        match Ser::encode(&init)
-                            .map(IntoEncodedString::into_encoded_string)
-                        {
-                            Ok(value) => sc.write_async(
-                                id,
-                                Box::pin(async move { value }),
-                            ),
-                            #[allow(unused_variables)] // used in tracing
-                            Err(e) => {
-                                #[cfg(feature = "tracing")]
-                                tracing::error!("couldn't serialize: {e:?}");
-                            }
+                if let Some(sc) = sc
+                    && sc.get_is_hydrating()
+                {
+                    match Ser::encode(&init)
+                        .map(IntoEncodedString::into_encoded_string)
+                    {
+                        Ok(value) => {
+                            sc.write_async(id, Box::pin(async move { value }))
+                        }
+                        #[allow(unused_variables)] // used in tracing
+                        Err(e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::error!("couldn't serialize: {e:?}");
                         }
                     }
                 }

@@ -2,8 +2,6 @@
 name = "benchmarks"
 version = "0.1.0"
 edition = "2021"
-# std::sync::LazyLock is stabilized in Rust version 1.80.0
-rust-version = "1.80.0"
 
 [dependencies]
 l0410 = { package = "leptos", version = "0.4.10", features = [
@@ -21,7 +19,7 @@ sycamore = { version = "0.8.0", features = ["ssr"] }
 yew = { version = "0.20.0", features = ["ssr"] }
 tokio-test = "0.4.0"
 miniserde = "0.1.0"
-gloo = "0.8.0"
+gloo = "0.12.0"
 uuid = { version = "1.0", features = ["serde", "v4", "wasm-bindgen"] }
 wasm-bindgen = "0.2.100"
 lazy_static = "1.0"

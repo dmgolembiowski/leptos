@@ -9,7 +9,7 @@ pub use path_segment::*;
 mod horizontal;
 mod nested;
 mod vertical;
-use crate::{static_routes::RegenerationFn, Method, SsrMode};
+use crate::{Method, SsrMode, static_routes::RegenerationFn};
 pub use horizontal::*;
 pub use nested::*;
 use std::{borrow::Cow, collections::HashSet, sync::atomic::Ordering};
@@ -60,12 +60,17 @@ where
         let path = match &self.base {
             None => path,
             Some(base) => {
-                let (base, path) = if base.starts_with('/') {
-                    (base.trim_start_matches('/'), path.trim_start_matches('/'))
+                let base = base.trim_matches('/');
+                if base.is_empty() {
+                    path
                 } else {
-                    (base.as_ref(), path)
-                };
-                path.strip_prefix(base)?
+                    let rest =
+                        path.trim_start_matches('/').strip_prefix(base)?;
+                    if !(rest.is_empty() || rest.starts_with('/')) {
+                        return None;
+                    }
+                    rest
+                }
             }
         };
 
@@ -120,6 +125,20 @@ pub trait MatchNestedRoutes {
     type Data;
     type Match: MatchInterface + MatchParams;
 
+    /// Matches nested routes
+    ///
+    /// # Arguments
+    ///
+    /// * path - A path which is being navigated to
+    ///
+    /// # Returns
+    ///
+    /// Tuple where
+    ///
+    /// * 0 - If match has been found `Some` containing tuple where
+    ///     * 0 - [RouteMatchId] identifying the matching route
+    ///     * 1 - [Self::Match] matching route
+    /// * 1 - Remaining path
     fn match_nested<'a>(
         &'a self,
         path: &'a str,
@@ -128,6 +147,8 @@ pub trait MatchNestedRoutes {
     fn generate_routes(
         &self,
     ) -> impl IntoIterator<Item = GeneratedRouteData> + '_;
+
+    fn optional(&self) -> bool;
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -142,10 +163,10 @@ pub struct GeneratedRouteData {
 mod tests {
     use super::{NestedRoute, ParamSegment, RouteDefs};
     use crate::{
-        matching::MatchParams, MatchInterface, PathSegment, StaticSegment,
-        WildcardSegment,
+        MatchInterface, PathSegment, StaticSegment, WildcardSegment,
+        matching::MatchParams,
     };
-    use either_of::Either;
+    use either_of::{Either, EitherOf4};
 
     #[test]
     pub fn matches_single_root_route() {
@@ -276,6 +297,28 @@ mod tests {
     }
 
     #[test]
+    pub fn nested_tuple_preserves_inner_route_match_id() {
+        use crate::matching::MatchNestedRoutes;
+
+        // Each NestedRoute is assigned a unique RouteMatchId at construction.
+        let three = (
+            NestedRoute::new(StaticSegment("a"), || ()),
+            NestedRoute::new(StaticSegment("b"), || ()),
+            NestedRoute::new(StaticSegment("c"), || ()),
+        );
+
+        // For each position, the id returned by the tuple's `match_nested`
+        // must be the matched route's own id (as reported by `as_id`), not the
+        // child's positional index within the tuple.
+        for path in ["/a", "/b", "/c"] {
+            let (matched, _) = three.match_nested(path);
+            let (id, m) = matched
+                .unwrap_or_else(|| panic!("`{path}` should match a route"));
+            assert_eq!(id, m.as_id());
+        }
+    }
+
+    #[test]
     pub fn arbitrary_nested_routes() {
         let routes: RouteDefs<_> = RouteDefs::new_with_base(
             (
@@ -322,12 +365,79 @@ mod tests {
         let params = matched.to_params();
         assert_eq!(params, vec![("any".into(), "foobar".into())]);
     }
+
+    #[test]
+    pub fn base_with_root_or_trailing_slash_matches() {
+        for (base, path) in [
+            ("/", "/about"),
+            ("/app/", "/app/about"),
+            ("/app", "/app/about"),
+            ("app", "/app/about"),
+            ("", "/about"),
+        ] {
+            let routes = RouteDefs::new_with_base(
+                NestedRoute::new(StaticSegment("about"), || ()),
+                base,
+            );
+            assert!(routes.match_route(path).is_some(), "base {base:?}");
+        }
+
+        let routes = RouteDefs::new_with_base(
+            NestedRoute::new(StaticSegment(""), || ()),
+            "/app",
+        );
+        assert!(routes.match_route("/app").is_some());
+
+        let routes = RouteDefs::new_with_base(
+            NestedRoute::new(ParamSegment("id"), || ()),
+            "/",
+        );
+        let matched = routes.match_route("/123").unwrap();
+        assert_eq!(matched.to_params(), vec![("id".into(), "123".into())]);
+    }
+
+    #[test]
+    pub fn base_must_match_whole_segment() {
+        let routes = RouteDefs::new_with_base(
+            NestedRoute::new(StaticSegment("about"), || ()),
+            "/app",
+        );
+
+        assert!(routes.match_route("/apple/about").is_none());
+        assert!(routes.match_route("/about").is_none());
+    }
+
+    #[test]
+    pub fn dont_match_smooshed_static_segments() {
+        let routes = RouteDefs::<_>::new((
+            NestedRoute::new(StaticSegment(""), || ()),
+            NestedRoute::new(StaticSegment("users"), || ()),
+            NestedRoute::new(
+                (StaticSegment("users"), StaticSegment("id")),
+                || (),
+            ),
+            NestedRoute::new(WildcardSegment("any"), || ()),
+        ));
+
+        let matched = routes.match_route("/users");
+        assert!(matches!(matched, Some(EitherOf4::B(..))));
+
+        let matched = routes.match_route("/users/id");
+        assert!(matches!(matched, Some(EitherOf4::C(..))));
+
+        let matched = routes.match_route("/usersid");
+        assert!(matches!(matched, Some(EitherOf4::D(..))));
+    }
 }
 
+/// Successful result of [testing](PossibleRouteMatch::test) a single segment in the route path
 #[derive(Debug)]
 pub struct PartialPathMatch<'a> {
+    /// unmatched yet part of the path
     pub(crate) remaining: &'a str,
+    /// value of parameters encoded inside of the path
     pub(crate) params: Vec<(Cow<'static, str>, String)>,
+    /// part of the original path that was matched by segment
     pub(crate) matched: &'a str,
 }
 

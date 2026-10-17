@@ -1,4 +1,4 @@
-use super::{node::ReactiveNode, AnySource};
+use super::{AnySource, node::ReactiveNode};
 #[cfg(debug_assertions)]
 use crate::diagnostics::SpecialNonReactiveZone;
 use core::{fmt::Debug, hash::Hash};
@@ -68,9 +68,9 @@ impl Observer {
     fn replace(observer: Option<AnySubscriber>) -> SetObserverOnDrop {
         SetObserverOnDrop(
             OBSERVER
-                .with(|o| {
+                .with_borrow_mut(|o| {
                     mem::replace(
-                        &mut *o.borrow_mut(),
+                        o,
                         observer.map(|subscriber| ObserverState {
                             subscriber,
                             untracked: false,
@@ -84,9 +84,9 @@ impl Observer {
     fn replace_untracked(observer: Option<AnySubscriber>) -> SetObserverOnDrop {
         SetObserverOnDrop(
             OBSERVER
-                .with(|o| {
+                .with_borrow_mut(|o| {
                     mem::replace(
-                        &mut *o.borrow_mut(),
+                        o,
                         observer.map(|subscriber| ObserverState {
                             subscriber,
                             untracked: true,

@@ -31,6 +31,10 @@ impl MatchNestedRoutes for () {
     type Data = ();
     type Match = ();
 
+    fn optional(&self) -> bool {
+        false
+    }
+
     fn match_nested<'a>(
         &self,
         path: &'a str,
@@ -94,6 +98,10 @@ where
         &self,
     ) -> impl IntoIterator<Item = GeneratedRouteData> + '_ {
         self.0.generate_routes()
+    }
+
+    fn optional(&self) -> bool {
+        self.0.optional()
     }
 }
 
@@ -180,6 +188,10 @@ where
 
         A.chain(B)
     }
+
+    fn optional(&self) -> bool {
+        self.0.optional() && self.1.optional()
+    }
 }
 
 impl<T> MatchNestedRoutes for StaticVec<T>
@@ -206,6 +218,10 @@ where
     ) -> impl IntoIterator<Item = GeneratedRouteData> + '_ {
         self.iter().flat_map(T::generate_routes)
     }
+
+    fn optional(&self) -> bool {
+        self.iter().all(|n| n.optional())
+    }
 }
 
 macro_rules! chain_generated {
@@ -221,7 +237,7 @@ macro_rules! chain_generated {
 }
 
 macro_rules! tuples {
-    ($either:ident => $($ty:ident = $count:expr),*) => {
+    ($either:ident => $($ty:ident),*) => {
         impl<'a, $($ty,)*> MatchParams for $either <$($ty,)*>
         where
 			$($ty: MatchParams),*,
@@ -273,12 +289,19 @@ macro_rules! tuples {
             type Data = ($($ty::Data,)*);
             type Match = $either<$($ty::Match,)*>;
 
+            fn optional(&self) -> bool {
+                #[allow(non_snake_case)]
+                let ($($ty,)*) = &self;
+                $($ty.optional() &&)*
+                true
+            }
+
             fn match_nested<'a>(&'a self, path: &'a str) -> (Option<(RouteMatchId, Self::Match)>, &'a str) {
                 #[allow(non_snake_case)]
 
                 let ($($ty,)*) = &self;
-                $(if let (Some((_, matched)), remaining) = $ty.match_nested(path) {
-                    return (Some((RouteMatchId($count), $either::$ty(matched))), remaining);
+                $(if let (Some((id, matched)), remaining) = $ty.match_nested(path) {
+                    return (Some((id, $either::$ty(matched))), remaining);
                 })*
                 (None, path)
             }
@@ -296,17 +319,17 @@ macro_rules! tuples {
     }
 }
 
-tuples!(EitherOf3 => A = 0, B = 1, C = 2);
-tuples!(EitherOf4 => A = 0, B = 1, C = 2, D = 3);
-tuples!(EitherOf5 => A = 0, B = 1, C = 2, D = 3, E = 4);
-tuples!(EitherOf6 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5);
-tuples!(EitherOf7 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6);
-tuples!(EitherOf8 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7);
-tuples!(EitherOf9 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8);
-tuples!(EitherOf10 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9);
-tuples!(EitherOf11 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10);
-tuples!(EitherOf12 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10, L = 11);
-tuples!(EitherOf13 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10, L = 11, M = 12);
-tuples!(EitherOf14 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10, L = 11, M = 12, N = 13);
-tuples!(EitherOf15 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10, L = 11, M = 12, N = 13, O = 14);
-tuples!(EitherOf16 => A = 0, B = 1, C = 2, D = 3, E = 4, F = 5, G = 6, H = 7, I = 8, J = 9, K = 10, L = 11, M = 12, N = 13, O = 14, P = 15);
+tuples!(EitherOf3 => A, B, C);
+tuples!(EitherOf4 => A, B, C, D);
+tuples!(EitherOf5 => A, B, C, D, E);
+tuples!(EitherOf6 => A, B, C, D, E, F);
+tuples!(EitherOf7 => A, B, C, D, E, F, G);
+tuples!(EitherOf8 => A, B, C, D, E, F, G, H);
+tuples!(EitherOf9 => A, B, C, D, E, F, G, H, I);
+tuples!(EitherOf10 => A, B, C, D, E, F, G, H, I, J);
+tuples!(EitherOf11 => A, B, C, D, E, F, G, H, I, J, K);
+tuples!(EitherOf12 => A, B, C, D, E, F, G, H, I, J, K, L);
+tuples!(EitherOf13 => A, B, C, D, E, F, G, H, I, J, K, L, M);
+tuples!(EitherOf14 => A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+tuples!(EitherOf15 => A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+tuples!(EitherOf16 => A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);

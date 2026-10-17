@@ -1,42 +1,49 @@
 use crate::{
-    children::{TypedChildren, ViewFnOnce},
     IntoView,
+    children::{TypedChildren, ViewFnOnce},
+    error::ErrorBoundarySuspendedChildren,
 };
-use futures::{select, FutureExt};
-use hydration_context::SerializedDataId;
+use futures::{FutureExt, channel::oneshot, future::poll_fn, select};
+use hydration_context::{SerializedDataId, SerializedDataIdScope};
 use leptos_macro::component;
+use or_poisoned::OrPoisoned;
 use reactive_graph::{
     computed::{
-        suspense::{LocalResourceNotifier, SuspenseContext},
         ArcMemo, ScopedFuture,
+        suspense::{LocalResourceNotifier, SuspenseContext},
     },
     effect::RenderEffect,
-    owner::{provide_context, use_context, Owner},
+    owner::{ArcStoredValue, Owner, provide_context, use_context},
     signal::ArcRwSignal,
-    traits::{Dispose, Get, Read, Track, With},
+    traits::{Get, Track, With, WithUntracked, WriteValue},
 };
 use slotmap::{DefaultKey, SlotMap};
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    task::Poll,
+};
+#[cfg(erase_components)]
+use tachys::view::any_view::IntoMaybeErased;
 use tachys::{
     either::Either,
-    html::attribute::{any_attribute::AnyAttribute, Attribute},
+    html::attribute::{Attribute, any_attribute::AnyAttribute},
     hydration::Cursor,
     reactive_graph::{OwnedView, OwnedViewState},
     ssr::StreamBuilder,
     view::{
+        Mountable, Position, PositionState, Render, RenderFlags, RenderHtml,
         add_attr::AddAnyAttr,
         either::{EitherKeepAlive, EitherKeepAliveState},
-        Mountable, Position, PositionState, Render, RenderHtml,
     },
 };
 use throw_error::ErrorHookFuture;
 
-/// If any [`Resource`](leptos_reactive::Resource) is read in the `children` of this
+/// If any [`Resource`](crate::prelude::Resource) is read in the `children` of this
 /// component, it will show the `fallback` while they are loading. Once all are resolved,
 /// it will render the `children`.
 ///
 /// Each time one of the resources is loading again, it will fall back. To keep the current
-/// children instead, use [Transition](crate::Transition).
+/// children instead, use [Transition](crate::prelude::Transition).
 ///
 /// Note that the `children` will be rendered initially (in order to capture the fact that
 /// those resources are read under the suspense), so you cannot assume that resources read
@@ -95,40 +102,59 @@ pub fn Suspense<Chil>(
     /// Children will be rendered once initially to catch any resource reads, then hidden until all
     /// data have loaded.
     children: TypedChildren<Chil>,
+    /// If `true`, disables the SSR "double-check" pass that re-walks the
+    /// children after initial resources resolve in order to discover
+    /// conditional/nested resource reads. Enable this when the children body
+    /// has no conditional resource reads but does have side effects that
+    /// should not fire more than once per render.
+    #[prop(optional)]
+    strict: bool,
 ) -> impl IntoView
 where
     Chil: IntoView + Send + 'static,
 {
+    let error_boundary_parent = use_context::<ErrorBoundarySuspendedChildren>();
+
     let owner = Owner::new();
     owner.with(|| {
         let (starts_local, id) = {
             Owner::current_shared_context()
                 .map(|sc| {
-                    let id = sc.next_id();
+                    let id = Owner::next_serialized_data_id(&*sc);
+                    provide_context(SerializedDataIdScope::new(id.clone()));
                     (sc.get_incomplete_chunk(&id), id)
                 })
                 .unwrap_or_else(|| (false, Default::default()))
         };
         let fallback = fallback.run();
+        #[cfg(erase_components)]
+        let children = children.into_inner()().into_maybe_erased();
+        #[cfg(not(erase_components))]
         let children = children.into_inner()();
         let tasks = ArcRwSignal::new(SlotMap::<DefaultKey, ()>::new());
-        provide_context(SuspenseContext {
-            tasks: tasks.clone(),
-        });
-        let none_pending = ArcMemo::new(move |prev: Option<&bool>| {
-            tasks.track();
-            if prev.is_none() && starts_local {
-                false
-            } else {
-                tasks.with(SlotMap::is_empty)
+        provide_context(SuspenseContext::new(tasks.clone()));
+        let none_pending = ArcMemo::new({
+            let tasks = tasks.clone();
+            move |prev: Option<&bool>| {
+                tasks.track();
+                if prev.is_none() && starts_local {
+                    false
+                } else {
+                    tasks.with(SlotMap::is_empty)
+                }
             }
         });
+        let has_tasks =
+            Arc::new(move || !tasks.with_untracked(SlotMap::is_empty));
 
         OwnedView::new(SuspenseBoundary::<false, _, _> {
             id,
             none_pending,
             fallback,
             children,
+            error_boundary_parent,
+            has_tasks,
+            strict,
         })
     })
 }
@@ -150,6 +176,12 @@ pub(crate) struct SuspenseBoundary<const TRANSITION: bool, Fal, Chil> {
     pub none_pending: ArcMemo<bool>,
     pub fallback: Fal,
     pub children: Chil,
+    pub error_boundary_parent: Option<ErrorBoundarySuspendedChildren>,
+    pub has_tasks: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// If `true`, the children are only walked once to register resources.
+    /// Conditional resource reads that depend on other resources will not be
+    /// discovered, but side effects in the children body run fewer times.
+    pub strict: bool,
 }
 
 impl<const TRANSITION: bool, Fal, Chil> Render
@@ -186,12 +218,26 @@ where
                 outer_owner.clone(),
             );
 
-            if let Some(mut state) = prev {
+            let state = if let Some(mut state) = prev {
                 this.rebuild(&mut state);
                 state
             } else {
                 this.build()
+            };
+
+            if nth_run == 1 && !(self.has_tasks)() {
+                // if this is the first run, and there are no pending resources at this point,
+                // it means that there were no actually-async resources read while rendering the children
+                // this means that we're effectively on the settled second run: none_pending
+                // won't change false => true and cause this to rerender (and therefore increment nth_run)
+                //
+                // we increment it manually here so that future resource changes won't cause the transition fallback
+                // to be displayed for the first time
+                // see https://github.com/leptos-rs/leptos/issues/3868, https://github.com/leptos-rs/leptos/issues/4492
+                nth_run += 1;
             }
+
+            state
         })
     }
 
@@ -228,12 +274,18 @@ where
             none_pending,
             fallback,
             children,
+            error_boundary_parent,
+            has_tasks,
+            strict,
         } = self;
         SuspenseBoundary {
             id,
             none_pending,
             fallback,
             children: children.add_any_attr(attr),
+            error_boundary_parent,
+            has_tasks,
+            strict,
         }
     }
 }
@@ -261,25 +313,18 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
-        self.fallback.to_html_with_buf(
-            buf,
-            position,
-            escape,
-            mark_branches,
-            extra_attrs,
-        );
+        self.fallback
+            .to_html_with_buf(buf, position, flags, extra_attrs);
     }
 
     fn to_html_async_with_buf<const OUT_OF_ORDER: bool>(
         mut self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -288,40 +333,57 @@ where
         let suspense_context = use_context::<SuspenseContext>().unwrap();
         let owner = Owner::current().unwrap();
 
+        let notify_error_boundary =
+            ArcStoredValue::new(self.error_boundary_parent.map(|children| {
+                let (tx, rx) = oneshot::channel();
+                children.write_value().push(rx);
+                tx
+            }));
+
         // we need to wait for one of two things: either
         // 1. all tasks are finished loading, or
         // 2. we read from a local resource, meaning this Suspense can never resolve on the server
 
-        // first, create listener for tasks
-        let tasks = suspense_context.tasks.clone();
-        let (tasks_tx, mut tasks_rx) =
-            futures::channel::oneshot::channel::<()>();
-
-        let mut tasks_tx = Some(tasks_tx);
-
-        // now, create listener for local resources
+        // first, create listener for local resources
         let (local_tx, mut local_rx) =
             futures::channel::oneshot::channel::<()>();
         provide_context(LocalResourceNotifier::from(local_tx));
 
-        // walk over the tree of children once to make sure that all resource loads are registered
-        self.children.dry_resolve();
+        let children = Arc::new(Mutex::new(Some(self.children)));
 
-        // check the set of tasks to see if it is empty, now or later
-        let eff = reactive_graph::effect::Effect::new_isomorphic({
-            move |_| {
-                tasks.track();
-                if let Some(tasks) = tasks.try_read() {
-                    if tasks.is_empty() {
-                        if let Some(tx) = tasks_tx.take() {
-                            // If the receiver has dropped, it means the ScopedFuture has already
-                            // dropped, so it doesn't matter if we manage to send this.
-                            _ = tx.send(());
+        // `tasks_ready` is a `Future` that is ready once every task registered with this
+        // `<Suspense/>` has finished.
+        let strict = self.strict;
+        let mut tasks_ready = Box::pin(
+            {
+                let suspense_context = suspense_context.clone();
+                let children = Arc::clone(&children);
+                // whether walking the tree again could reveal a resource read
+                // we haven't tracked yet
+                let mut may_reveal_more = true;
+                poll_fn(move |cx| {
+                    loop {
+                        if !suspense_context.poll_empty(cx.waker()) {
+                            return Poll::Pending;
                         }
+
+                        if !may_reveal_more {
+                            return Poll::Ready(());
+                        }
+
+                        if let Some(children) =
+                            children.lock().or_poisoned().as_mut()
+                        {
+                            children.dry_resolve();
+                        }
+
+                        may_reveal_more =
+                            !strict && !suspense_context.poll_empty(cx.waker());
                     }
-                }
+                })
             }
-        });
+            .fuse(),
+        );
 
         let mut fut = Box::pin(ScopedFuture::new(ErrorHookFuture::new(
             async move {
@@ -342,15 +404,33 @@ where
                     _ = local_rx => {
                         let sc = Owner::current_shared_context().expect("no shared context");
                         sc.set_incomplete_chunk(self.id);
+                        if let Some(tx) =
+                            notify_error_boundary.write_value().take()
+                        {
+                            let _ = tx.send(());
+                        }
                         None
                     }
-                    _ = tasks_rx => {
+                    _ = tasks_ready => {
+                        // every task has finished, so the error boundary can
+                        // render its children too
+                        if let Some(tx) =
+                            notify_error_boundary.write_value().take()
+                        {
+                            let _ = tx.send(());
+                        }
+
+                        let children = {
+                            let mut children_lock = children.lock().or_poisoned();
+                            children_lock.take().expect("children should not be removed until we render here")
+                        };
+
                         // if we ran this earlier, reactive reads would always be registered as None
                         // this is fine in the case where we want to use Suspend and .await on some future
                         // but in situations like a <For each=|| some_resource.snapshot()/> we actually
                         // want to be able to 1) synchronously read a resource's value, but still 2) wait
                         // for it to load before we render everything
-                        let mut children = Box::pin(self.children.resolve().fuse());
+                        let mut children = Box::pin(children.resolve().fuse());
 
                         // we continue racing the children against the "do we have any local
                         // resources?" Future
@@ -358,12 +438,14 @@ where
                             _ = local_rx => {
                                 let sc = Owner::current_shared_context().expect("no shared context");
                                 sc.set_incomplete_chunk(self.id);
+                                if let Some(tx) =
+                                    notify_error_boundary.write_value().take()
+                                {
+                                    let _ = tx.send(());
+                                }
                                 None
                             }
                             children = children => {
-                                // clean up the (now useless) effect
-                                eff.dispose();
-
                                 Some(OwnedView::new_with_owner(children, owner))
                             }
                         }
@@ -377,8 +459,7 @@ where
                     .to_html_async_with_buf::<OUT_OF_ORDER>(
                         buf,
                         position,
-                        escape,
-                        mark_branches,
+                        flags,
                         extra_attrs,
                     );
             }
@@ -387,8 +468,7 @@ where
                     .to_html_async_with_buf::<OUT_OF_ORDER>(
                         buf,
                         position,
-                        escape,
-                        mark_branches,
+                        flags,
                         extra_attrs,
                     );
             }
@@ -402,17 +482,22 @@ where
                     buf.push_fallback(
                         self.fallback,
                         &mut fallback_position,
-                        mark_branches,
+                        flags.mark_branches,
                         extra_attrs.clone(),
                     );
                     buf.push_async_out_of_order_with_nonce(
                         fut,
                         position,
-                        mark_branches,
+                        flags.mark_branches,
                         nonce_or_not(),
                         extra_attrs,
                     );
                 } else {
+                    // calling this will walk over the tree, removing all event listeners
+                    // and other single-threaded values from the view tree. this needs to be
+                    // done because the fallback can be shifted to another thread in push_async below.
+                    self.fallback.dry_resolve();
+
                     buf.push_async({
                         let mut position = *position;
                         async move {
@@ -424,8 +509,7 @@ where
                             value.to_html_async_with_buf::<OUT_OF_ORDER>(
                                 &mut builder,
                                 &mut position,
-                                escape,
-                                mark_branches,
+                                flags,
                                 extra_attrs,
                             );
                             builder.finish().take_chunks()
@@ -475,6 +559,71 @@ where
                 this.hydrate::<FROM_SERVER>(&cursor, &position)
             }
         })
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let cursor = cursor.to_owned();
+        let position = position.to_owned();
+
+        let mut children = Some(self.children);
+        let mut fallback = Some(self.fallback);
+        let none_pending = self.none_pending;
+        let outer_owner = Owner::new();
+
+        // hydrate outside the effect so pending children can be awaited;
+        // the effect then only rebuilds
+        let taken_children = children.take();
+        let taken_fallback = fallback.take();
+        let initial = {
+            let none_pending = none_pending.clone();
+            let outer_owner = outer_owner.clone();
+            async move {
+                // first run, so the TRANSITION term is always true
+                let show_b = !none_pending.get();
+                OwnedView::new_with_owner(
+                    EitherKeepAlive {
+                        a: taken_children,
+                        b: taken_fallback,
+                        show_b,
+                    },
+                    outer_owner,
+                )
+                .hydrate_async(&cursor, &position)
+                .await
+            }
+        };
+
+        RenderEffect::new_with_async_value(
+            {
+                let mut nth_run = 1;
+                move |prev| {
+                    let show_b =
+                        !none_pending.get() && (!TRANSITION || nth_run < 1);
+                    nth_run += 1;
+                    let this = OwnedView::new_with_owner(
+                        EitherKeepAlive {
+                            a: children.take(),
+                            b: fallback.take(),
+                            show_b,
+                        },
+                        outer_owner.clone(),
+                    );
+
+                    if let Some(mut state) = prev {
+                        this.rebuild(&mut state);
+                        state
+                    } else {
+                        unreachable!()
+                    }
+                }
+            },
+            initial,
+        )
+        .await
     }
 
     fn into_owned(self) -> Self::Owned {
@@ -546,25 +695,17 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
-        (self.0)().to_html_with_buf(
-            buf,
-            position,
-            escape,
-            mark_branches,
-            extra_attrs,
-        );
+        (self.0)().to_html_with_buf(buf, position, flags, extra_attrs);
     }
 
     fn to_html_async_with_buf<const OUT_OF_ORDER: bool>(
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -572,8 +713,7 @@ where
         (self.0)().to_html_async_with_buf::<OUT_OF_ORDER>(
             buf,
             position,
-            escape,
-            mark_branches,
+            flags,
             extra_attrs,
         );
     }
@@ -584,6 +724,14 @@ where
         position: &PositionState,
     ) -> Self::State {
         (self.0)().hydrate::<FROM_SERVER>(cursor, position)
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        (self.0)().hydrate_async(cursor, position).await
     }
 
     fn into_owned(self) -> Self::Owned {

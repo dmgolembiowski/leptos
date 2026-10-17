@@ -1,6 +1,6 @@
 use super::{
-    IntoChooseViewMaybeErased, MatchInterface, MatchNestedRoutes,
-    PartialPathMatch, PathSegment, PossibleRouteMatch, RouteMatchId,
+    IntoChooseViewMaybeErased, MatchInterface, MatchNestedRoutes, PathSegment,
+    PossibleRouteMatch, RouteMatchId,
 };
 use crate::{ChooseView, GeneratedRouteData, MatchParams, Method, SsrMode};
 use core::{fmt, iter};
@@ -189,61 +189,118 @@ where
     Self: 'static,
     Segments: PossibleRouteMatch,
     Children: MatchNestedRoutes,
-    Children::Match: MatchParams,
-    Children: 'static,
-    View: ChooseView + Clone,
+    View: ChooseView,
 {
     type Data = Data;
     type Match = NestedMatch<Children::Match, View>;
+
+    fn optional(&self) -> bool {
+        self.segments.optional()
+            && self.children.as_ref().map(|n| n.optional()).unwrap_or(true)
+    }
 
     fn match_nested<'a>(
         &'a self,
         path: &'a str,
     ) -> (Option<(RouteMatchId, Self::Match)>, &'a str) {
+        // if this was optional (for example, this whole nested route definition consisted of an optional param),
+        // then we'll need to retest the inner value against the starting path, if this one succeeds and the inner one fails
+        let this_was_optional = self.segments.optional();
+
         self.segments
             .test(path)
-            .and_then(
-                |PartialPathMatch {
-                     remaining,
-                     mut params,
-                     matched,
-                 }| {
-                    let (_, inner, remaining) = match &self.children {
-                        None => (None, None, remaining),
+            .and_then({
+                type Params = Vec<(Cow<'static, str>, String)>;
+
+                // codegen optimisation:
+                fn inner<'a, Children>(
+                    this_was_optional: bool,
+                    path: &'a str,
+                    remaining: &'a str,
+                    segments: &dyn PossibleRouteMatch,
+                    children: &'a Option<Children>,
+                    mut params: Params,
+                ) -> Option<(Option<Children::Match>, &'a str, Params)>
+                where
+                    Children: MatchNestedRoutes,
+                {
+                    let mut was_optional_fallback = false;
+
+                    let (child, remaining) = match children {
+                        None => (None, remaining),
                         Some(children) => {
                             let (inner, remaining) =
                                 children.match_nested(remaining);
-                            let (id, inner) = inner?;
-                            (Some(id), Some(inner), remaining)
+
+                            if let Some((_, child)) = inner {
+                                (Some(child), remaining)
+                            } else if this_was_optional {
+                                // if the parent route was optional, re-match children against full path
+                                was_optional_fallback = true;
+                                let (inner, remaining) =
+                                    children.match_nested(path);
+                                inner.map(|(_, child)| {
+                                    (Some(child), remaining)
+                                })?
+                            } else {
+                                return None;
+                            }
                         }
                     };
-                    let inner_params = inner
-                        .as_ref()
-                        .map(|inner| inner.to_params())
-                        .unwrap_or_default();
-
-                    let id = RouteMatchId(self.id);
 
                     if remaining.is_empty() || remaining == "/" {
-                        params.extend(inner_params);
-                        Some((
-                            Some((
-                                id,
-                                NestedMatch {
-                                    id,
-                                    matched: matched.to_string(),
-                                    params,
-                                    child: inner,
-                                    view_fn: self.view.clone(),
-                                },
-                            )),
-                            remaining,
-                        ))
+                        // if this was an optional route, re-parse its params
+                        if was_optional_fallback {
+                            // new params are based on the path it matched (up to the point where the matched child begins)
+                            // e.g., if we have /:foo?/bar, for /bar we should *not* have { "foo": "bar" }
+                            // so, we re-parse based on "" to yield { "foo": "" }
+                            let matched = child
+                                .as_ref()
+                                .map_or("", Children::Match::as_matched);
+                            let rematch = path.trim_end_matches(&format!(
+                                "{matched}{remaining}"
+                            ));
+                            let new_partial = segments.test(rematch)?;
+                            params = new_partial.params;
+                        }
+
+                        params.extend(
+                            child
+                                .as_ref()
+                                .map_or(Vec::new(), Children::Match::to_params),
+                        );
+                        Some((child, remaining, params))
                     } else {
                         None
                     }
-                },
-            )
+                }
+
+                |partial_match| {
+                    let (child, remaining, params) = inner(
+                        this_was_optional,
+                        path,
+                        partial_match.remaining,
+                        &self.segments,
+                        &self.children,
+                        partial_match.params,
+                    )?;
+                    let id = RouteMatchId(self.id);
+
+                    Some((
+                        Some((
+                            id,
+                            NestedMatch {
+                                id,
+                                matched: partial_match.matched.to_string(),
+                                params,
+                                child,
+                                view_fn: self.view.clone(),
+                            },
+                        )),
+                        remaining,
+                    ))
+                }
+            })
             .unwrap_or((None, path))
     }
 
@@ -305,5 +362,38 @@ where
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NestedRoute;
+    use crate::{MatchParams, OptionalParamSegment, RouteDefs, StaticSegment};
+
+    #[test]
+    fn optional_fallback_rematch_failure_returns_none() {
+        let routes = RouteDefs::new(
+            NestedRoute::new(
+                (OptionalParamSegment("x"), StaticSegment("bar")),
+                || (),
+            )
+            .child(NestedRoute::new(StaticSegment("bar"), || ())),
+        );
+
+        assert!(routes.match_route("/bar").is_none());
+
+        let matched = routes
+            .match_route("/foo/bar/bar")
+            .expect("route should match with optional parameter");
+        assert_eq!(matched.to_params(), vec![("x".into(), "foo".into())]);
+
+        let optional_routes = RouteDefs::new(
+            NestedRoute::new(OptionalParamSegment("foo"), || ())
+                .child(NestedRoute::new(StaticSegment("bar"), || ())),
+        );
+        let matched = optional_routes
+            .match_route("/bar")
+            .expect("route should match without optional parameter");
+        assert!(matched.to_params().is_empty());
     }
 }

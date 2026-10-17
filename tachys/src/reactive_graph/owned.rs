@@ -1,11 +1,15 @@
 use crate::{
-    html::attribute::{any_attribute::AnyAttribute, Attribute},
+    html::attribute::{Attribute, any_attribute::AnyAttribute},
     hydration::Cursor,
     prelude::Mountable,
     ssr::StreamBuilder,
-    view::{add_attr::AddAnyAttr, Position, PositionState, Render, RenderHtml},
+    view::{
+        Position, PositionState, Render, RenderFlags, RenderHtml,
+        add_attr::AddAnyAttr,
+    },
 };
 use reactive_graph::{computed::ScopedFuture, owner::Owner};
+use std::mem;
 
 /// A view wrapper that sets the reactive [`Owner`] to a particular owner whenever it is rendered.
 #[derive(Debug, Clone)]
@@ -33,8 +37,12 @@ pub struct OwnedViewState<T>
 where
     T: Mountable,
 {
-    owner: Owner,
+    // note: the drop order of the fields matters here
+    // dropping `state` before `owner` ensures that cleanups happen
+    // from the bottom up: i.e., the child state is dropped before
+    // any other cleanups attached to this owner are fired
     state: T,
+    owner: Owner,
 }
 
 impl<T> OwnedViewState<T>
@@ -61,7 +69,13 @@ where
     fn rebuild(self, state: &mut Self::State) {
         let OwnedView { owner, view, .. } = self;
         owner.with(|| view.rebuild(&mut state.state));
-        state.owner = owner;
+        // Defer dropping the previous owner until after effects have run:
+        // render effects that do things like reading from context it provides
+        // may have already been triggered and queued to run. `spawn_local` will
+        // defer the drop to the end of the queue, while still deterministically
+        // cleaning up the memory to prevent leaks.
+        let old_owner = mem::replace(&mut state.owner, owner);
+        reactive_graph::spawn_local(async move { drop(old_owner) });
     }
 }
 
@@ -100,18 +114,12 @@ where
         self,
         buf: &mut String,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) {
         self.owner.with(|| {
-            self.view.to_html_with_buf(
-                buf,
-                position,
-                escape,
-                mark_branches,
-                extra_attrs,
-            )
+            self.view
+                .to_html_with_buf(buf, position, flags, extra_attrs)
         });
     }
 
@@ -119,8 +127,7 @@ where
         self,
         buf: &mut StreamBuilder,
         position: &mut Position,
-        escape: bool,
-        mark_branches: bool,
+        flags: RenderFlags,
         extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
@@ -129,8 +136,7 @@ where
             self.view.to_html_async_with_buf::<OUT_OF_ORDER>(
                 buf,
                 position,
-                escape,
-                mark_branches,
+                flags,
                 extra_attrs,
             )
         });
@@ -150,6 +156,20 @@ where
         let state = self
             .owner
             .with(|| self.view.hydrate::<FROM_SERVER>(cursor, position));
+        OwnedViewState::new(state, self.owner)
+    }
+
+    async fn hydrate_async(
+        self,
+        cursor: &Cursor,
+        position: &PositionState,
+    ) -> Self::State {
+        let state = self
+            .owner
+            .with(|| {
+                ScopedFuture::new(self.view.hydrate_async(cursor, position))
+            })
+            .await;
         OwnedViewState::new(state, self.owner)
     }
 
@@ -187,6 +207,14 @@ where
         marker: Option<&crate::renderer::types::Node>,
     ) {
         self.state.mount(parent, marker);
+    }
+
+    fn try_mount(
+        &mut self,
+        parent: &crate::renderer::types::Element,
+        marker: Option<&crate::renderer::types::Node>,
+    ) -> bool {
+        self.state.try_mount(parent, marker)
     }
 
     fn insert_before_this(&self, child: &mut dyn Mountable) -> bool {

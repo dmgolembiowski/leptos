@@ -1,15 +1,15 @@
 use crate::{FromEncodedStr, IntoEncodedString};
+#[cfg(feature = "serde-lite")]
+use codee::SerdeLite;
 #[cfg(feature = "rkyv")]
 use codee::binary::RkyvCodec;
 #[cfg(feature = "serde-wasm-bindgen")]
 use codee::string::JsonSerdeWasmCodec;
 #[cfg(feature = "miniserde")]
 use codee::string::MiniserdeCodec;
-#[cfg(feature = "serde-lite")]
-use codee::SerdeLite;
 use codee::{
-    string::{FromToStringCodec, JsonSerdeCodec},
     Decoder, Encoder,
+    string::{FromToStringCodec, JsonSerdeCodec},
 };
 use core::{fmt::Debug, marker::PhantomData};
 use futures::Future;
@@ -25,26 +25,38 @@ use reactive_graph::{
     signal::{ArcRwSignal, RwSignal},
 };
 use std::{
-    future::{pending, IntoFuture},
-    ops::Deref,
+    future::{IntoFuture, pending},
+    ops::{Deref, DerefMut},
     panic::Location,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-pub(crate) static IS_SUPPRESSING_RESOURCE_LOAD: AtomicBool =
-    AtomicBool::new(false);
+/// The number of live [`SuppressResourceLoad`] guards. Resource loading is
+/// suppressed while this is greater than zero. A counter rather than a boolean
+/// is used so that nested guards compose correctly.
+pub(crate) static SUPPRESS_RESOURCE_LOAD_COUNT: AtomicUsize =
+    AtomicUsize::new(0);
+
+/// Returns whether resource loading is currently suppressed by one or more
+/// live [`SuppressResourceLoad`] guards.
+pub(crate) fn suppressing_resource_load() -> bool {
+    SUPPRESS_RESOURCE_LOAD_COUNT.load(Ordering::Acquire) > 0
+}
 
 /// Used to prevent resources from actually loading, in environments (like server route generation)
 /// where they are not needed.
+///
+/// Guards are reentrant: nesting two of them keeps suppression active until the
+/// outermost guard is dropped.
 pub struct SuppressResourceLoad;
 
 impl SuppressResourceLoad {
-    /// Prevents resources from loading until this is dropped.
+    /// Prevents resources from loading until this (and any outer guard) is dropped.
     pub fn new() -> Self {
-        IS_SUPPRESSING_RESOURCE_LOAD.store(true, Ordering::Relaxed);
+        SUPPRESS_RESOURCE_LOAD_COUNT.fetch_add(1, Ordering::Release);
         Self
     }
 }
@@ -57,7 +69,7 @@ impl Default for SuppressResourceLoad {
 
 impl Drop for SuppressResourceLoad {
     fn drop(&mut self) {
-        IS_SUPPRESSING_RESOURCE_LOAD.store(false, Ordering::Relaxed);
+        SUPPRESS_RESOURCE_LOAD_COUNT.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -162,6 +174,65 @@ where
     }
 }
 
+impl<T, Ser> Notify for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T, Ser> Write for ArcResource<T, Ser>
+where
+    T: 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static RESOURCE_SOURCE_SIGNAL_ACTIVE: AtomicBool = const { AtomicBool::new(false) };
+}
+
+#[cfg(debug_assertions)]
+/// Returns whether the current thread is currently running a resource source signal.
+pub fn in_resource_source_signal() -> bool {
+    RESOURCE_SOURCE_SIGNAL_ACTIVE
+        .with(|scope| scope.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set a static to true whilst running the given function.
+/// [`is_in_effect_scope`] will return true whilst the function is running.
+fn run_in_resource_source_signal<T>(fun: impl FnOnce() -> T) -> T {
+    #[cfg(debug_assertions)]
+    {
+        // For the theoretical nested case, set back to initial value rather than false:
+        let initial = RESOURCE_SOURCE_SIGNAL_ACTIVE.with(|scope| {
+            scope.swap(true, std::sync::atomic::Ordering::Relaxed)
+        });
+        let result = fun();
+        RESOURCE_SOURCE_SIGNAL_ACTIVE.with(|scope| {
+            scope.store(initial, std::sync::atomic::Ordering::Relaxed)
+        });
+        result
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        fun()
+    }
+}
+
 impl<T, Ser> ReadUntracked for ArcResource<T, Ser>
 where
     T: 'static,
@@ -176,7 +247,9 @@ where
                 computed::suspense::SuspenseContext, effect::in_effect_scope,
                 owner::use_context,
             };
-            if !in_effect_scope() && use_context::<SuspenseContext>().is_none()
+            if !in_effect_scope()
+                && !in_resource_source_signal()
+                && use_context::<SuspenseContext>().is_none()
             {
                 let location = std::panic::Location::caller();
                 reactive_graph::log_warning(format_args!(
@@ -236,7 +309,7 @@ where
         let shared_context = Owner::current_shared_context();
         let id = shared_context
             .as_ref()
-            .map(|sc| sc.next_id())
+            .map(|sc| Owner::next_serialized_data_id(&**sc))
             .unwrap_or_default();
 
         let initial = initial_value::<T, Ser>(&id, shared_context.as_ref());
@@ -245,7 +318,7 @@ where
         let refetch = ArcRwSignal::new(0);
         let source = ArcMemo::new({
             let refetch = refetch.clone();
-            move |_| (refetch.get(), source())
+            move |_| (refetch.get(), run_in_resource_source_signal(&source))
         });
         let fun = {
             let source = source.clone();
@@ -253,7 +326,7 @@ where
                 let (_, source) = source.get();
                 let fut = fetcher(source);
                 async move {
-                    if IS_SUPPRESSING_RESOURCE_LOAD.load(Ordering::Relaxed) {
+                    if suppressing_resource_load() {
                         pending().await
                     } else {
                         fut.await
@@ -285,11 +358,39 @@ where
                     Box::pin(async move {
                         ready_fut.await;
                         value.with_untracked(|data| match &data {
-                            // TODO handle serialization errors
-                            Some(val) => {
-                                Ser::encode(val).unwrap().into_encoded_string()
+                            Some(val) => match Ser::encode(val) {
+                                Ok(encoded) => encoded.into_encoded_string(),
+                                Err(e) => {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::error!(
+                                        "error serializing resource for \
+                                         hydration: {e:?}"
+                                    );
+                                    #[cfg(not(feature = "tracing"))]
+                                    eprintln!(
+                                        "error serializing resource for \
+                                         hydration: {e:?}"
+                                    );
+                                    String::new()
+                                }
+                            },
+                            // The value can be taken out from under the SSR
+                            // task (e.g. via `try_write_untracked`). Emit an
+                            // empty payload that fails to decode on the client
+                            // (so it reloads) instead of aborting the stream.
+                            None => {
+                                #[cfg(feature = "tracing")]
+                                tracing::error!(
+                                    "resource value missing while serializing \
+                                     for hydration"
+                                );
+                                #[cfg(not(feature = "tracing"))]
+                                eprintln!(
+                                    "resource value missing while serializing \
+                                     for hydration"
+                                );
+                                String::new()
                             }
-                            _ => unreachable!(),
                         })
                     }),
                 );
@@ -339,7 +440,6 @@ where
     {
         use std::borrow::Borrow;
 
-        let shared_context = Owner::current_shared_context();
         if let Some(shared_context) = shared_context {
             let value = shared_context.read_data(id);
             if let Some(value) = value {
@@ -683,6 +783,7 @@ where
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rkyv")))]
 impl<T> ArcResource<T, RkyvCodec>
 where
     RkyvCodec: Encoder<T> + Decoder<T>,
@@ -842,6 +943,32 @@ where
     }
 }
 
+impl<T, Ser> Notify for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    fn notify(&self) {
+        self.data.notify()
+    }
+}
+
+impl<T, Ser> Write for Resource<T, Ser>
+where
+    T: Send + Sync + 'static,
+{
+    type Value = Option<T>;
+
+    fn try_write(&self) -> Option<impl UntrackableGuard<Target = Self::Value>> {
+        self.data.try_write()
+    }
+
+    fn try_write_untracked(
+        &self,
+    ) -> Option<impl DerefMut<Target = Self::Value>> {
+        self.data.try_write_untracked()
+    }
+}
+
 impl<T, Ser> ReadUntracked for Resource<T, Ser>
 where
     T: Send + Sync + 'static,
@@ -856,7 +983,9 @@ where
                 computed::suspense::SuspenseContext, effect::in_effect_scope,
                 owner::use_context,
             };
-            if !in_effect_scope() && use_context::<SuspenseContext>().is_none()
+            if !in_effect_scope()
+                && !in_resource_source_signal()
+                && use_context::<SuspenseContext>().is_none()
             {
                 let location = std::panic::Location::caller();
                 reactive_graph::log_warning(format_args!(
@@ -996,6 +1125,7 @@ where
 }
 
 #[cfg(feature = "serde-wasm-bindgen")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-wasm-bindgen")))]
 impl<T> Resource<T, JsonSerdeWasmCodec>
 where
     JsonSerdeWasmCodec: Encoder<T> + Decoder<T>,
@@ -1053,6 +1183,7 @@ where
 }
 
 #[cfg(feature = "miniserde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "miniserde")))]
 impl<T> Resource<T, MiniserdeCodec>
 where
     MiniserdeCodec: Encoder<T> + Decoder<T>,
@@ -1112,6 +1243,7 @@ where
 }
 
 #[cfg(feature = "serde-lite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde-lite")))]
 impl<T> Resource<T, SerdeLite<JsonSerdeCodec>>
 where
     SerdeLite<JsonSerdeCodec>: Encoder<T> + Decoder<T>,
@@ -1170,6 +1302,7 @@ where
 }
 
 #[cfg(feature = "rkyv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rkyv")))]
 impl<T> Resource<T, RkyvCodec>
 where
     RkyvCodec: Encoder<T> + Decoder<T>,
@@ -1335,5 +1468,35 @@ where
     /// value by reference.
     pub fn by_ref(&self) -> AsyncDerivedRefFuture<T> {
         self.data.by_ref()
+    }
+}
+
+#[cfg(test)]
+mod suppress_resource_load_tests {
+    use super::{SuppressResourceLoad, suppressing_resource_load};
+
+    // Touches the process-global suppression counter, so it is kept as a
+    // single test to avoid interfering with any other in-crate test.
+    #[test]
+    fn nested_guards_suppress_until_outermost_drops() {
+        assert!(!suppressing_resource_load());
+
+        let outer = SuppressResourceLoad::new();
+        assert!(suppressing_resource_load());
+
+        {
+            let _inner = SuppressResourceLoad::new();
+            assert!(suppressing_resource_load());
+        }
+        // The inner guard has dropped, but the outer one is still alive, so
+        // suppression must remain active. (With the previous boolean flag this
+        // assertion failed: the inner drop cleared it.)
+        assert!(
+            suppressing_resource_load(),
+            "suppression cleared while an outer guard was still alive"
+        );
+
+        drop(outer);
+        assert!(!suppressing_resource_load());
     }
 }

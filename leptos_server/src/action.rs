@@ -3,7 +3,10 @@ use reactive_graph::{
     owner::use_context,
     traits::DefinedAt,
 };
-use server_fn::{error::FromServerFnError, ServerFn};
+use server_fn::{
+    ServerFn,
+    error::{FromServerFnError, ServerFnUrlError},
+};
 use std::{ops::Deref, panic::Location, sync::Arc};
 
 /// An error that can be caused by a server action.
@@ -59,7 +62,7 @@ where
     pub fn new() -> Self {
         let err = use_context::<ServerActionError>().and_then(|error| {
             (error.path() == S::PATH)
-                .then(|| S::Error::de(error.err()))
+                .then(|| ServerFnUrlError::<S::Error>::decode_err(error.err()))
                 .map(Err)
         });
         Self {
@@ -144,10 +147,11 @@ where
     S::Error: Send + Sync + 'static,
 {
     /// Creates a new [`Action`] that will call the server function `S` when dispatched.
+    #[track_caller]
     pub fn new() -> Self {
         let err = use_context::<ServerActionError>().and_then(|error| {
             (error.path() == S::PATH)
-                .then(|| S::Error::de(error.err()))
+                .then(|| ServerFnUrlError::<S::Error>::decode_err(error.err()))
                 .map(Err)
         });
         Self {

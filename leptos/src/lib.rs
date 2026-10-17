@@ -1,5 +1,4 @@
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
 
 //! # About Leptos
 //!
@@ -84,13 +83,22 @@
 //!
 //! # Feature Flags
 //!
-//! - **`nightly`**: On `nightly` Rust, enables the function-call syntax for signal getters and setters.
+//! - **`nightly`**: On `nightly` Rust, enables some experimental optimizations that improve the
+//!   handling of static strings and the performance of the `template! {}` macro.
 //! - **`csr`** Client-side rendering: Generate DOM nodes in the browser.
 //! - **`ssr`** Server-side rendering: Generate an HTML string (typically on the server).
+//! - **`islands`** Activates “islands mode,” in which components are not made interactive on the
+//!   client unless they use the `#[island]` macro.
 //! - **`hydrate`** Hydration: use this to add interactivity to an SSRed Leptos app.
-//! - **`rkyv`** In SSR/hydrate mode, uses [`rkyv`](https://docs.rs/rkyv/latest/rkyv/) to serialize resources and send them
-//!   from the server to the client.
+//! - **`nonce`** Adds support for nonces to be added as part of a Content Security Policy.
+//! - **`rkyv`** In SSR/hydrate mode, enables using [`rkyv`](https://docs.rs/rkyv/latest/rkyv/) to serialize resources.
 //! - **`tracing`** Adds support for [`tracing`](https://docs.rs/tracing/latest/tracing/).
+//! - **`trace-component-props`** Adds `tracing` support for component props.
+//! - **`delegation`** Uses event delegation rather than the browser’s native event handling
+//!   system. (This improves the performance of creating large numbers of elements simultaneously,
+//!   in exchange for occasional edge cases in which events behave differently from native browser
+//!   events.)
+//! - **`rustls`** Use `rustls` for server functions.
 //!
 //! **Important Note:** You must enable one of `csr`, `hydrate`, or `ssr` to tell Leptos
 //! which mode your app is operating in. You should only enable one of these per build target,
@@ -123,7 +131,7 @@
 //! }
 //! ```
 //!
-//! Leptos is easy to use with [Trunk](https://trunkrs.dev/) (or with a simple wasm-bindgen setup):
+//! Leptos is easy to use with [Trunk](https://trunk-rs.github.io/trunk/) (or with a simple wasm-bindgen setup):
 //!
 //! ```rust
 //! use leptos::{mount::mount_to_body, prelude::*};
@@ -141,9 +149,6 @@
 //! }
 //! ```
 
-#![cfg_attr(feature = "nightly", feature(fn_traits))]
-#![cfg_attr(feature = "nightly", feature(unboxed_closures))]
-
 extern crate self as leptos;
 
 /// Exports all the core types of the library.
@@ -157,11 +162,10 @@ pub mod prelude {
     // In the future, maybe we should remove this blanket export
     // However, it is definitely useful relative to looking up every struct etc.
     mod export_types {
-        #[cfg(feature = "nonce")]
-        pub use crate::nonce::*;
         pub use crate::{
             callback::*, children::*, component::*, control_flow::*, error::*,
-            form::*, hydration::*, into_view::*, mount::*, suspense::*,
+            form::*, hydration::*, into_view::*, mount::*, nonce::*,
+            suspense::*, text_prop::*,
         };
         pub use leptos_config::*;
         pub use leptos_dom::helpers::*;
@@ -169,12 +173,20 @@ pub mod prelude {
         pub use leptos_server::*;
         pub use oco_ref::*;
         pub use reactive_graph::{
-            actions::*, computed::*, effect::*, graph::untrack, owner::*,
-            signal::*, wrappers::read::*,
+            actions::*,
+            computed::*,
+            effect::*,
+            graph::untrack,
+            owner::*,
+            signal::*,
+            wrappers::{read::*, write::*},
         };
-        pub use server_fn::{self, error::ServerFnError};
+        pub use server_fn::{
+            self,
+            error::{FromServerFnError, ServerFnError, ServerFnErrorErr},
+        };
         pub use tachys::{
-            reactive_graph::{bind::BindAttribute, node_ref::*, Suspend},
+            reactive_graph::{Suspend, bind::BindAttribute, node_ref::*},
             view::{fragment::Fragment, template::ViewTemplate},
         };
     }
@@ -185,7 +197,7 @@ pub mod prelude {
 pub mod form;
 
 /// A standard way to wrap functions and closures to pass them to components.
-pub mod callback;
+pub use reactive_graph::callback;
 
 /// Types that can be passed as the `children` prop of a component.
 pub mod children;
@@ -204,14 +216,20 @@ pub mod error {
     pub use throw_error::*;
 }
 
+mod lazy_view_error;
+pub use lazy_view_error::LazyViewError;
+
 /// Control-flow components like `<Show>`, `<For>`, and `<Await>`.
 pub mod control_flow {
-    pub use crate::{animated_show::*, await_::*, for_loop::*, show::*};
+    pub use crate::{
+        animated_show::*, await_::*, for_loop::*, show::*, show_let::*,
+    };
 }
 mod animated_show;
 mod await_;
 mod for_loop;
 mod show;
+mod show_let;
 
 /// A component that allows rendering a component somewhere else.
 pub mod portal;
@@ -220,7 +238,6 @@ pub mod portal;
 pub mod hydration;
 
 /// Utilities for exporting nonces to be used for a Content Security Policy.
-#[cfg(feature = "nonce")]
 pub mod nonce;
 
 /// Components to load asynchronous data.
@@ -237,6 +254,29 @@ mod transition;
 pub use leptos_macro::*;
 #[doc(inline)]
 pub use server_fn;
+
+/// Type-erase a reactive closure into a [`tachys::reactive_graph::SharedReactiveFunction`].
+///
+/// Helper used by the `view!` macro when compiled with `RUSTFLAGS="--cfg erase_components"`.
+/// Wrapping `move || expr` in this helper makes every reactive child closure resolve
+/// to the same type (`Arc<Mutex<dyn FnMut() -> T + Send>>`) instead of a unique
+/// anonymous closure type per call site, so downstream `Render`/`Effect` machinery
+/// monomorphizes per output type `T` rather than per closure `F`.
+///
+/// Trade-off: one `Arc<Mutex<_>>` allocation per closure + a vtable dispatch per render,
+/// in exchange for substantially less monomorphization (smaller WASM, faster compile).
+#[doc(hidden)]
+#[cfg(erase_components)]
+#[inline]
+pub fn __as_shared_reactive_fn<T, F>(
+    f: F,
+) -> ::std::sync::Arc<::std::sync::Mutex<dyn FnMut() -> T + Send>>
+where
+    F: FnMut() -> T + Send + 'static,
+    T: 'static,
+{
+    ::std::sync::Arc::new(::std::sync::Mutex::new(f))
+}
 #[doc(hidden)]
 pub use typed_builder;
 #[doc(hidden)]
@@ -284,21 +324,36 @@ pub use tachys::mathml as math;
 #[doc(inline)]
 pub use tachys::svg;
 
+#[cfg(feature = "subsecond")]
+/// Utilities for using binary hot-patching with [`subsecond`].
+pub mod subsecond;
+
 /// Utilities for simple isomorphic logging to the console or terminal.
 pub mod logging {
-    pub use leptos_dom::{debug_warn, error, log, warn};
+    pub use leptos_dom::{
+        debug_error, debug_log, debug_warn, error, log, warn,
+    };
 }
 
 /// Utilities for working with asynchronous tasks.
 pub mod task {
-    pub use any_spawner::{self, CustomExecutor, Executor};
+    use any_spawner::Executor;
+    use reactive_graph::computed::ScopedFuture;
     use std::future::Future;
 
     /// Spawns a thread-safe [`Future`].
+    ///
+    /// This will be run with the current reactive owner and observer using a [`ScopedFuture`].
     #[track_caller]
     #[inline(always)]
     pub fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
-        Executor::spawn(fut)
+        let fut = ScopedFuture::new(fut);
+
+        #[cfg(not(target_family = "wasm"))]
+        Executor::spawn(fut);
+
+        #[cfg(target_family = "wasm")]
+        Executor::spawn_local(fut);
     }
 
     /// Spawns a [`Future`] that cannot be sent across threads.
@@ -322,7 +377,6 @@ pub mod task {
 #[cfg(feature = "islands")]
 #[doc(hidden)]
 pub use serde;
-#[cfg(feature = "islands")]
 #[doc(hidden)]
 pub use serde_json;
 #[cfg(feature = "tracing")]
@@ -331,4 +385,42 @@ pub use tracing;
 #[doc(hidden)]
 pub use wasm_bindgen;
 #[doc(hidden)]
+pub use wasm_split_helpers as wasm_split;
+#[doc(hidden)]
 pub use web_sys;
+
+#[doc(hidden)]
+pub mod __reexports {
+    pub use send_wrapper;
+    pub use wasm_bindgen_futures;
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct PrefetchLazyFn(
+    pub  reactive_graph::owner::ArcStoredValue<
+        std::collections::HashSet<&'static str>,
+    >,
+);
+
+#[doc(hidden)]
+pub fn prefetch_lazy_fn_on_server(id: &'static str) {
+    use crate::context::use_context;
+    use reactive_graph::traits::WriteValue;
+
+    if let Some(prefetches) = use_context::<PrefetchLazyFn>()
+        && let Some(mut set) = prefetches.0.try_write_value()
+    {
+        set.insert(id);
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct WasmSplitManifest(
+    pub  reactive_graph::owner::ArcStoredValue<(
+        String,                                         // the pkg root
+        std::collections::HashMap<String, Vec<String>>, // preloads
+        String, // the name of the __wasm_split.js file
+    )>,
+);
